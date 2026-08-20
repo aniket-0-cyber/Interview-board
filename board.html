@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interview board</title>
+<style>
+  :root {
+    --paper:      #F7F5F0;
+    --rule:       #DFD9CC;
+    --ink:        #1C1F26;
+    --ink-soft:   #6B6E78;
+    --claude:     #3A6EA5;   /* cool ink = Claude wrote it */
+    --you:        #A65D3A;   /* warm ink = you wrote it   */
+    --panel:      #FFFFFF;
+    --private:    #B08300;   /* the interviewer's own layer */
+    --grid:       #E7E2D6;
+    --shadow:     0 1px 2px rgba(28,31,38,.06), 0 6px 18px rgba(28,31,38,.07);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #16181D; --rule: #2C3038; --ink: #E8E6E1;
+      --ink-soft: #8A8F9A; --panel: #1D2027;
+      --claude: #6FA3DB; --you: #D08A62; --private: #D6B24A;
+      --grid: #1F232A;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 6px 20px rgba(0,0,0,.35);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; overflow: hidden; }
+  body {
+    background: var(--paper); color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, "Inter", system-ui, sans-serif;
+    display: flex; flex-direction: column;
+    -webkit-font-smoothing: antialiased;
+  }
+  button, select, input, textarea { font: inherit; color: inherit; }
+
+  /* ---------- top bar ---------- */
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; border-bottom: 1px solid var(--rule);
+    background: var(--panel); flex: none; position: relative; z-index: 30;
+  }
+  /* In a narrow app window the tools must stay reachable, so the name and the
+     saved-board picker give up their width first and the row wraps last. */
+  #board-name { flex: 0 1 auto; min-width: 5ch; }
+  select.picker { flex: 0 1 auto; min-width: 6ch; }
+  .tools { flex: none; }
+  @media (max-width: 720px) {
+    header { flex-wrap: wrap; row-gap: 6px; }
+    .spacer { flex-basis: 100%; height: 0; }
+  }
+  #board-name {
+    font-weight: 600; font-size: 15px; border: 1px solid transparent;
+    background: none; padding: 3px 7px; border-radius: 6px; min-width: 8ch;
+    max-width: 30ch;
+  }
+  #board-name:hover { border-color: var(--rule); }
+  #board-name:focus { outline: none; border-color: var(--claude); background: var(--paper); }
+  .bar-sep { width: 1px; height: 22px; background: var(--rule); }
+  .tools { display: flex; gap: 2px; }
+  .tool, .ghost {
+    border: 1px solid transparent; background: none; border-radius: 7px;
+    padding: 5px 9px; cursor: pointer; color: var(--ink-soft); white-space: nowrap;
+  }
+  .tool:hover, .ghost:hover { background: var(--paper); color: var(--ink); }
+  .tool[aria-pressed="true"] {
+    background: var(--claude); border-color: var(--claude); color: #fff;
+  }
+  .spacer { flex: 1; }
+  select.picker {
+    background: var(--paper); border: 1px solid var(--rule);
+    border-radius: 7px; padding: 5px 8px; max-width: 22ch;
+  }
+  .status { display: flex; align-items: center; gap: 6px; color: var(--ink-soft); font-size: 12.5px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-soft); opacity: .5; }
+  .dot.live { background: #4C9A63; opacity: 1; }
+  .pill {
+    font-size: 11.5px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--private); color: var(--private); letter-spacing: .02em;
+  }
+
+  /* ---------- layout ---------- */
+  main { flex: 1; display: flex; min-height: 0; }
+  #stage {
+    flex: 1; position: relative; overflow: hidden; min-width: 0;
+    background-color: var(--paper);
+    background-image: radial-gradient(var(--grid) 1px, transparent 1px);
+    background-size: 22px 22px;
+    cursor: default;
+  }
+  #stage.panning { cursor: grabbing; }
+  #stage.adding  { cursor: crosshair; }
+  #stage.linking { cursor: crosshair; }
+  #world { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #wires { position: absolute; left: -4000px; top: -3000px; width: 12000px; height: 9000px;
+           pointer-events: none; overflow: visible; }
+  #wires path { fill: none; stroke: var(--ink-soft); stroke-width: 1.75; }
+  #wires path.claude { stroke: var(--claude); }
+  #wires path.dashed { stroke-dasharray: 6 5; }
+  #wires text { fill: var(--ink-soft); font-size: 11.5px; paint-order: stroke;
+                stroke: var(--paper); stroke-width: 4px; }
+  #wires .hit { stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
+
+  /* ---------- nodes ---------- */
+  .node { position: absolute; display: flex; flex-direction: column; }
+  .node .frame {
+    flex: 1; min-height: 0; display: flex; flex-direction: column;
+    border: 1px solid var(--rule); border-radius: 10px;
+    background: var(--panel); box-shadow: var(--shadow); overflow: hidden;
+  }
+  .node.claude .frame { border-color: color-mix(in srgb, var(--claude) 45%, var(--rule)); }
+  .node.user   .frame { border-color: color-mix(in srgb, var(--you) 40%, var(--rule)); }
+  .node.private .frame { border-style: dashed; border-color: var(--private); }
+  .node.selected .frame { outline: 2px solid var(--claude); outline-offset: 1px; }
+  .node.pulse .frame { animation: pulse .7s ease-out; }
+  @keyframes pulse {
+    from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--claude) 55%, transparent), var(--shadow); }
+    to   { box-shadow: 0 0 0 14px transparent, var(--shadow); }
+  }
+
+  .head {
+    display: flex; align-items: center; gap: 6px; flex: none;
+    padding: 5px 6px 5px 9px; border-bottom: 1px solid var(--rule);
+    background: color-mix(in srgb, var(--paper) 55%, var(--panel));
+    cursor: grab; user-select: none;
+  }
+  .head:active { cursor: grabbing; }
+  .head .title {
+    flex: 1; min-width: 0; font-size: 12.5px; font-weight: 600;
+    border: 1px solid transparent; border-radius: 5px; padding: 1px 4px;
+    background: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .head .title:focus { outline: none; border-color: var(--claude); background: var(--panel); }
+  .head .title:empty::before { content: attr(data-placeholder); color: var(--ink-soft); font-weight: 500; }
+  .head select {
+    border: 1px solid transparent; background: none; border-radius: 5px;
+    font-size: 11.5px; color: var(--ink-soft); padding: 1px 2px; max-width: 11ch;
+  }
+  .head select:hover { border-color: var(--rule); }
+  .icon {
+    border: none; background: none; cursor: pointer; color: var(--ink-soft);
+    padding: 2px 5px; border-radius: 5px; line-height: 1; font-size: 13px; opacity: 0;
+  }
+  .node:hover .icon, .node.selected .icon { opacity: 1; }
+  .icon:hover { background: var(--paper); color: var(--ink); }
+  .icon.on { opacity: 1; color: var(--private); }
+
+  /* document body: highlighted layer under a transparent textarea */
+  .doc-body { position: relative; flex: 1; min-height: 0; }
+  .doc-body pre, .doc-body textarea {
+    position: absolute; inset: 0; margin: 0; padding: 9px 11px;
+    font: 12.5px/1.55 ui-monospace, "SF Mono", Menlo, monospace;
+    white-space: pre; overflow: auto; border: 0; tab-size: 2;
+  }
+  .doc-body pre { pointer-events: none; color: var(--ink); }
+  .doc-body textarea {
+    background: transparent; color: transparent; caret-color: var(--ink);
+    resize: none; outline: none; width: 100%; height: 100%;
+  }
+  .doc-body textarea::selection { background: color-mix(in srgb, var(--claude) 35%, transparent); }
+  .tok-str { color: #9A6A2F; } .tok-num { color: #7A4FA3; }
+  .tok-kw  { color: var(--claude); font-weight: 600; } .tok-com { color: var(--ink-soft); font-style: italic; }
+  @media (prefers-color-scheme: dark) { .tok-str { color: #D5A45E; } .tok-num { color: #B693DD; } }
+
+  /* prose documents read as prose, not code */
+  .node[data-lang="markdown"] .doc-body pre,
+  .node[data-lang="markdown"] .doc-body textarea,
+  .node[data-lang="text"] .doc-body pre,
+  .node[data-lang="text"] .doc-body textarea {
+    font: 13.5px/1.6 ui-sans-serif, system-ui, sans-serif; white-space: pre-wrap;
+  }
+
+  /* box + text nodes */
+  .node.box .frame { border-radius: 10px; }
+  .node.box.ellipse .frame { border-radius: 50%; }
+  .node.box.diamond .frame { border-radius: 4px; transform: rotate(45deg); }
+  .node.box.diamond .label { transform: rotate(-45deg); }
+  .node.box .label, .node.text .label {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 8px 10px; outline: none; overflow: hidden;
+  }
+  .node.text .frame {
+    background: none; border-color: transparent; box-shadow: none;
+  }
+  .node.text .label { justify-content: flex-start; font-size: 14.5px; }
+  .node.text.selected .frame { border-color: var(--rule); }
+
+  #diagram-sizer { position: absolute; visibility: hidden; pointer-events: none; }
+  .diagram-body { flex: 1; min-height: 0; display: grid; place-items: center; padding: 8px; overflow: auto; }
+  .diagram-body svg { max-width: 100%; height: auto; }
+  .diagram-body .empty, .empty { color: var(--ink-soft); font-size: 12.5px; }
+
+  .grip {
+    position: absolute; right: -3px; bottom: -3px; width: 15px; height: 15px;
+    cursor: nwse-resize; opacity: 0; z-index: 2;
+  }
+  .grip::after {
+    content: ""; position: absolute; right: 4px; bottom: 4px; width: 7px; height: 7px;
+    border-right: 2px solid var(--ink-soft); border-bottom: 2px solid var(--ink-soft);
+    border-radius: 0 0 3px 0;
+  }
+  .node:hover .grip, .node.selected .grip { opacity: .8; }
+  .port {
+    position: absolute; inset: -7px; border: 2px dashed var(--claude); border-radius: 13px;
+    opacity: 0; pointer-events: none;
+  }
+  #stage.linking .node .port { opacity: .45; }
+  #stage.linking .node:hover .port, .node.link-source .port { opacity: 1; }
+
+  /* ---------- interviewer side panel ---------- */
+  aside {
+    width: 296px; flex: none; border-left: 1px solid var(--rule);
+    background: var(--panel); display: flex; flex-direction: column; min-height: 0;
+  }
+  body:not(.host) aside { display: none; }
+  aside h2 {
+    font-size: 11.5px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--ink-soft); margin: 0; padding: 11px 14px 7px; font-weight: 600;
+  }
+  aside .band { border-top: 1px solid var(--rule); display: flex; flex-direction: column; min-height: 0; }
+  aside .band:first-child { border-top: 0; }
+  #notes { list-style: none; margin: 0; padding: 0 8px 8px; overflow-y: auto; flex: 1; min-height: 60px; }
+  #notes li {
+    display: flex; gap: 7px; align-items: flex-start;
+    padding: 5px 6px; border-radius: 7px; font-size: 13px;
+  }
+  #notes li:hover { background: var(--paper); }
+  #notes .who { width: 4px; align-self: stretch; border-radius: 2px; flex: none; background: var(--you); }
+  #notes li.claude .who { background: var(--claude); }
+  #notes .txt { flex: 1; min-width: 0; }
+  #notes .del { opacity: 0; }
+  #notes li:hover .del { opacity: .7; }
+  #note-input, #rubric-input {
+    margin: 0 14px 12px; padding: 7px 9px; border: 1px solid var(--rule);
+    border-radius: 8px; background: var(--paper); outline: none; width: calc(100% - 28px);
+  }
+  #note-input:focus, #rubric-input:focus { border-color: var(--claude); }
+  #rubric { list-style: none; margin: 0; padding: 0 8px 8px; overflow-y: auto; max-height: 40vh; }
+  #rubric li { padding: 6px; border-radius: 7px; }
+  #rubric li:hover { background: var(--paper); }
+  #rubric .row { display: flex; align-items: center; gap: 6px; }
+  #rubric .label { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+  #rubric .note { font-size: 12px; color: var(--ink-soft); padding-left: 2px; margin-top: 2px; }
+  .verdicts { display: flex; gap: 3px; }
+  .verdicts button {
+    border: 1px solid var(--rule); background: none; border-radius: 6px;
+    font-size: 11px; padding: 2px 6px; cursor: pointer; color: var(--ink-soft);
+  }
+  .verdicts button[aria-pressed="true"] { color: #fff; border-color: transparent; }
+  .verdicts button[data-v="strong"][aria-pressed="true"] { background: #4C9A63; }
+  .verdicts button[data-v="mixed"][aria-pressed="true"]  { background: #B08300; }
+  .verdicts button[data-v="weak"][aria-pressed="true"]   { background: #B4553E; }
+
+  #hint {
+    position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
+    background: var(--panel); border: 1px solid var(--rule); border-radius: 999px;
+    padding: 6px 14px; font-size: 12.5px; color: var(--ink-soft);
+    box-shadow: var(--shadow); pointer-events: none; opacity: 0; transition: opacity .18s;
+  }
+  #hint.show { opacity: 1; }
+  #empty-hint {
+    position: absolute; inset: 0; display: grid; place-items: center;
+    color: var(--ink-soft); font-size: 14px; text-align: center; pointer-events: none;
+  }
+  #empty-hint[hidden] { display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <input id="board-name" value="Untitled board" spellcheck="false" aria-label="Board name">
+  <select class="picker" id="board-picker" aria-label="Open a saved board"><option value="">Saved boards…</option></select>
+  <button class="ghost" id="new-board">New</button>
+  <div class="bar-sep"></div>
+  <div class="tools" role="toolbar" aria-label="Canvas tools">
+    <button class="tool" data-tool="select" aria-pressed="true" title="Select and drag — V">Select</button>
+    <button class="tool" data-tool="box"    aria-pressed="false" title="Draw a box — B">Box</button>
+    <button class="tool" data-tool="text"   aria-pressed="false" title="Add a label — T">Text</button>
+    <button class="tool" data-tool="doc"    aria-pressed="false" title="Add a document — D">Doc</button>
+    <button class="tool" data-tool="line"   aria-pressed="false" title="Connect two nodes — L">Line</button>
+  </div>
+  <button class="ghost" id="tidy" title="Reflow everything onto a grid">Tidy</button>
+  <div class="spacer"></div>
+  <span class="pill" id="host-pill" hidden>interviewer view</span>
+  <div class="status"><span class="dot" id="dot"></span><span id="conn">connecting</span></div>
+</header>
+
+<main>
+  <div id="stage">
+    <div id="world">
+      <svg id="wires"><g id="wire-layer" transform="translate(4000,3000)"></g></svg>
+    </div>
+    <div id="empty-hint">Nothing on the board yet.<br>Ask Claude out loud, or pick a tool above.</div>
+    <div id="hint"></div>
+  </div>
+
+  <aside>
+    <div class="band">
+      <h2>Private notes</h2>
+      <ul id="notes"></ul>
+      <input id="note-input" placeholder="Note to self — the candidate never sees this" spellcheck="false">
+    </div>
+    <div class="band">
+      <h2>Rubric</h2>
+      <ul id="rubric"></ul>
+      <input id="rubric-input" placeholder="Add a dimension, e.g. Edge cases" spellcheck="false">
+    </div>
+  </aside>
+</main>
+
+<div id="diagram-sizer"></div>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const token = new URLSearchParams(location.search).get("t") || "";
+
+let mermaid = null;
+try {
+  ({ default: mermaid } = await import("https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs"));
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  mermaid.initialize({ startOnLoad: false, theme: dark ? "dark" : "neutral", securityLevel: "strict" });
+} catch { /* offline: diagrams fall back to their source text */ }
+
+/* ---------------------------------------------------------------- state */
+let ws = null;
+let state = { nodes: {}, edges: {}, notes: [], rubric: [], host: false, saved: [] };
+let tool = "select";
+let selected = null;
+let linkFrom = null;
+let dragging = null;          // id being dragged/resized locally: ignore server geometry
+const els = new Map();        // node id -> element record
+const stamps = new Map();     // node id -> last seen content stamp, for the pulse
+
+function send(msg) { if (ws?.readyState === 1) ws.send(JSON.stringify(msg)); }
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws?t=${encodeURIComponent(token)}`);
+  ws.onopen = () => { $("conn").textContent = "live"; $("dot").classList.add("live"); };
+  ws.onclose = () => {
+    $("conn").textContent = "reconnecting"; $("dot").classList.remove("live");
+    setTimeout(connect, 1200);
+  };
+  ws.onmessage = e => {
+    const { board, origin } = JSON.parse(e.data);
+    state = board;
+    render(origin);
+  };
+}
+
+/* ---------------------------------------------------------- pan and zoom */
+const view = { x: 0, y: 0, z: 1 };
+function applyView() {
+  $("world").style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.z})`;
+}
+function toWorld(clientX, clientY) {
+  const r = $("stage").getBoundingClientRect();
+  return { x: (clientX - r.left - view.x) / view.z, y: (clientY - r.top - view.y) / view.z };
+}
+
+$("stage").addEventListener("wheel", e => {
+  e.preventDefault();
+  if (e.ctrlKey || e.metaKey) {
+    const before = toWorld(e.clientX, e.clientY);
+    view.z = Math.min(2.5, Math.max(0.25, view.z * (1 - e.deltaY / 400)));
+    const after = toWorld(e.clientX, e.clientY);
+    view.x += (after.x - before.x) * view.z;
+    view.y += (after.y - before.y) * view.z;
+  } else {
+    view.x -= e.deltaX; view.y -= e.deltaY;
+  }
+  applyView();
+}, { passive: false });
+
+/* --------------------------------------------------------------- tools */
+function setTool(next) {
+  tool = next;
+  for (const b of document.querySelectorAll(".tool"))
+    b.setAttribute("aria-pressed", String(b.dataset.tool === next));
+  $("stage").classList.toggle("adding", ["box", "text", "doc"].includes(next));
+  $("stage").classList.toggle("linking", next === "line");
+  linkFrom = null;
+  document.querySelector(".link-source")?.classList.remove("link-source");
+  hint(next === "line" ? "Click one node, then another, to connect them"
+     : ["box", "text", "doc"].includes(next) ? "Click anywhere on the canvas to place it" : "");
+}
+for (const b of document.querySelectorAll(".tool"))
+  b.addEventListener("click", () => setTool(b.dataset.tool));
+$("tidy").addEventListener("click", () => send({ type: "user_arrange" }));
+
+let hintTimer = null;
+function hint(text) {
+  clearTimeout(hintTimer);
+  $("hint").textContent = text;
+  $("hint").classList.toggle("show", Boolean(text));
+  if (text) hintTimer = setTimeout(() => $("hint").classList.remove("show"), 2600);
+}
+
+addEventListener("keydown", e => {
+  const typing = /^(INPUT|TEXTAREA)$/.test(e.target.tagName) || e.target.isContentEditable;
+  if (typing) {
+    if (e.key === "Escape") e.target.blur();
+    return;
+  }
+  const keys = { v: "select", b: "box", t: "text", d: "doc", l: "line" };
+  if (keys[e.key.toLowerCase()]) { setTool(keys[e.key.toLowerCase()]); return; }
+  if (e.key === "Escape") { setTool("select"); select(null); }
+  if ((e.key === "Backspace" || e.key === "Delete") && selected) {
+    send({ type: "user_delete", id: selected });
+    select(null);
+  }
+});
+
+/* ------------------------------------------------------ placing + panning */
+let pan = null;
+$("stage").addEventListener("pointerdown", e => {
+  if (e.target.closest(".node")) return;                 // the node handles its own
+  if (["box", "text", "doc"].includes(tool)) {
+    const at = toWorld(e.clientX, e.clientY);
+    send({
+      type: "user_add", kind: tool, x: Math.round(at.x), y: Math.round(at.y),
+      text: tool === "doc" ? "" : tool === "box" ? "Box" : "Text",
+      language: "python",
+    });
+    setTool("select");
+    return;
+  }
+  select(null);
+  pan = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
+  $("stage").classList.add("panning");
+  $("stage").setPointerCapture(e.pointerId);
+});
+$("stage").addEventListener("pointermove", e => {
+  if (!pan) return;
+  view.x = pan.vx + (e.clientX - pan.x);
+  view.y = pan.vy + (e.clientY - pan.y);
+  applyView();
+});
+addEventListener("pointerup", () => { pan = null; $("stage").classList.remove("panning"); });
+
+function select(id) {
+  selected = id;
+  for (const [nodeId, rec] of els) rec.root.classList.toggle("selected", nodeId === id);
+}
+
+/* ------------------------------------------------------------ highlighting */
+const KEYWORDS = "\\b(?:def|class|return|yield|lambda|pass|raise|assert|del|global|"
+  + "if|elif|else|for|while|break|continue|try|except|finally|with|as|in|is|not|and|or|"
+  + "import|from|async|await|None|True|False|self|"
+  + "const|let|var|function|new|this|typeof|instanceof|export|default|extends|super|"
+  + "interface|type|enum|implements|public|private|protected|static|readonly|"
+  + "int|float|double|bool|char|void|struct|impl|fn|mut|pub|match|trait|package|func|defer|go|"
+  + "select|where|group|order|by|join|having|insert|update|delete|values)\\b";
+// Comments, strings, numbers and keywords share one alternation. A second pass
+// over the result would cheerfully match a keyword inside the markup the first
+// pass had just written — "class" in a span attribute, for instance.
+const TOKENS = new RegExp(
+  '(#[^\\n]*|//[^\\n]*|/\\*[\\s\\S]*?\\*/'
+  + '|"""[\\s\\S]*?"""'
+  + "|'''[\\s\\S]*?'''"
+  + '|"(?:\\\\.|[^"\\\\])*"'
+  + "|'(?:\\\\.|[^'\\\\])*'"
+  + '|`(?:\\\\.|[^`\\\\])*`)'
+  + '|(\\b\\d[\\d_.]*(?:e[+-]?\\d+)?\\b)'
+  + '|(' + KEYWORDS + ')', "g");
+const escapeHtml = s => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+function highlight(src, lang) {
+  const safe = escapeHtml(src);
+  if (lang === "markdown" || lang === "text") return safe;
+  return safe.replace(TOKENS, (m, lit, num, kw) => {
+    if (lit) {
+      const comment = lit.startsWith("#") || lit.startsWith("//") || lit.startsWith("/*");
+      return `<span class="${comment ? "tok-com" : "tok-str"}">${lit}</span>`;
+    }
+    if (num) return `<span class="tok-num">${num}</span>`;
+    return `<span class="tok-kw">${kw}</span>`;
+  });
+}
+
+/* ------------------------------------------------------------- node views */
+const LANGS = ["python", "javascript", "typescript", "java", "cpp", "go", "rust", "sql", "markdown", "text"];
+const debouncers = new Map();
+function debounce(key, fn, ms = 260) {
+  clearTimeout(debouncers.get(key));
+  debouncers.set(key, setTimeout(fn, ms));
+}
+
+function makeNode(node) {
+  const root = document.createElement("div");
+  root.className = `node ${node.type}`;
+  root.dataset.id = node.id;
+
+  const frame = document.createElement("div");
+  frame.className = "frame";
+  root.append(frame);
+
+  const port = document.createElement("div");
+  port.className = "port";
+  root.append(port);
+
+  const rec = { root, frame, type: node.type };
+
+  if (node.type === "doc" || node.type === "diagram") {
+    const head = document.createElement("div");
+    head.className = "head";
+
+    const title = document.createElement("div");
+    title.className = "title";
+    title.contentEditable = "plaintext-only";
+    title.spellcheck = false;
+    title.dataset.placeholder = node.type === "doc" ? "Untitled" : "Diagram";
+    title.addEventListener("input", () =>
+      debounce(node.id + ":title", () => send({ type: "user_title", id: node.id, title: title.textContent })));
+    head.append(title);
+    rec.title = title;
+
+    if (node.type === "doc") {
+      const lang = document.createElement("select");
+      lang.append(...LANGS.map(l => new Option(l, l)));
+      lang.addEventListener("change", () => send({ type: "user_language", id: node.id, language: lang.value }));
+      head.append(lang);
+      rec.lang = lang;
+    }
+
+    if (state.host) {
+      const lock = document.createElement("button");
+      lock.className = "icon";
+      lock.title = "Keep this on the interviewer's view only";
+      lock.textContent = "◐";
+      lock.addEventListener("click", () =>
+        send({ type: "user_private", id: node.id, private: !rec.node.private }));
+      head.append(lock);
+      rec.lock = lock;
+    }
+
+    const close = document.createElement("button");
+    close.className = "icon";
+    close.title = "Remove";
+    close.textContent = "×";
+    close.addEventListener("click", () => send({ type: "user_delete", id: node.id }));
+    head.append(close);
+
+    frame.append(head);
+    rec.head = head;
+
+    if (node.type === "doc") {
+      const body = document.createElement("div");
+      body.className = "doc-body";
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      pre.append(code);
+      const ta = document.createElement("textarea");
+      ta.spellcheck = false;
+      ta.addEventListener("input", () => {
+        code.innerHTML = highlight(ta.value, rec.node.language);
+        debounce(node.id + ":text", () => send({ type: "user_text", id: node.id, text: ta.value }), 200);
+      });
+      ta.addEventListener("scroll", () => { pre.scrollTop = ta.scrollTop; pre.scrollLeft = ta.scrollLeft; });
+      ta.addEventListener("keydown", e => {
+        if (e.key === "Tab") {
+          e.preventDefault();
+          const { selectionStart: s, selectionEnd: t } = ta;
+          ta.value = ta.value.slice(0, s) + "  " + ta.value.slice(t);
+          ta.selectionStart = ta.selectionEnd = s + 2;
+          ta.dispatchEvent(new Event("input"));
+        }
+      });
+      body.append(pre, ta);
+      frame.append(body);
+      Object.assign(rec, { body, pre, code, ta });
+    } else {
+      const body = document.createElement("div");
+      body.className = "diagram-body";
+      frame.append(body);
+      rec.body = body;
+    }
+  } else {
+    const label = document.createElement("div");
+    label.className = "label";
+    label.contentEditable = "plaintext-only";
+    label.spellcheck = false;
+    label.addEventListener("input", () =>
+      debounce(node.id + ":text", () => send({ type: "user_text", id: node.id, text: label.textContent })));
+    frame.append(label);
+    rec.label = label;
+  }
+
+  // Linking is intercepted on the way down, ahead of the drag and text-editing
+  // handlers below — otherwise a single click reaches two of them and the second
+  // cancels what the first just started.
+  root.addEventListener("pointerdown", e => {
+    if (tool !== "line") return;
+    e.preventDefault();
+    e.stopPropagation();
+    linkClick(node.id);
+  }, true);
+
+  const grip = document.createElement("div");
+  grip.className = "grip";
+  root.append(grip);
+  dragBehaviour(rec, node.id, grip);
+
+  $("world").append(root);
+  return rec;
+}
+
+function dragBehaviour(rec, id, grip) {
+  const handle = rec.head || rec.frame;
+
+  handle.addEventListener("pointerdown", e => {
+    if (e.target.closest(".icon, select, .title")) return;
+    if (rec.type !== "doc" && rec.type !== "diagram" && e.target.isContentEditable
+        && document.activeElement === e.target) return;
+    e.preventDefault();
+    e.stopPropagation();
+    select(id);
+    const start = toWorld(e.clientX, e.clientY);
+    const from = { x: rec.node.x, y: rec.node.y };
+    dragging = id;
+    handle.setPointerCapture(e.pointerId);
+
+    const move = ev => {
+      const at = toWorld(ev.clientX, ev.clientY);
+      rec.node.x = Math.round(from.x + at.x - start.x);
+      rec.node.y = Math.round(from.y + at.y - start.y);
+      place(rec);
+      drawWires();
+    };
+    const stop = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", stop);
+      dragging = null;
+      send({ type: "user_move", id, x: rec.node.x, y: rec.node.y });
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", stop);
+  });
+
+  grip.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    e.stopPropagation();
+    const start = toWorld(e.clientX, e.clientY);
+    const from = { w: rec.node.w, h: rec.node.h };
+    dragging = id;
+    grip.setPointerCapture(e.pointerId);
+
+    const move = ev => {
+      const at = toWorld(ev.clientX, ev.clientY);
+      rec.node.w = Math.max(80, Math.round(from.w + at.x - start.x));
+      rec.node.h = Math.max(40, Math.round(from.h + at.y - start.y));
+      place(rec);
+      drawWires();
+    };
+    const stop = () => {
+      grip.removeEventListener("pointermove", move);
+      grip.removeEventListener("pointerup", stop);
+      dragging = null;
+      send({ type: "user_resize", id, w: rec.node.w, h: rec.node.h });
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", stop);
+  });
+
+}
+
+function linkClick(id) {
+  if (!linkFrom) {
+    linkFrom = id;
+    els.get(id)?.root.classList.add("link-source");
+    hint("Now click the node it connects to");
+    return;
+  }
+  if (linkFrom !== id) send({ type: "user_connect", from: linkFrom, to: id });
+  els.get(linkFrom)?.root.classList.remove("link-source");
+  linkFrom = null;
+  setTool("select");
+}
+
+function place(rec) {
+  const { x, y, w, h } = rec.node;
+  Object.assign(rec.root.style, { left: `${x}px`, top: `${y}px`, width: `${w}px`, height: `${h}px` });
+}
+
+const diagramCache = new Map();
+async function paintDiagram(rec, node) {
+  if (diagramCache.get(node.id) === node.text) return;
+  diagramCache.set(node.id, node.text);
+  const src = (node.text || "").trim();
+  if (!src) { rec.body.innerHTML = '<div class="empty">Nothing drawn yet.</div>'; return; }
+  if (!mermaid) { rec.body.replaceChildren(Object.assign(document.createElement("pre"), { textContent: src })); return; }
+  try {
+    const { svg } = await mermaid.render("m" + node.id + Date.now(), src);
+    rec.body.innerHTML = svg;
+  } catch {
+    rec.body.replaceChildren(Object.assign(document.createElement("pre"), { textContent: src }));
+  }
+}
+
+function stamp(node) {
+  return `${node.text}|${node.title}|${node.language}|${node.private}|${node.w}|${node.h}`;
+}
+
+function paint(rec, node, origin) {
+  rec.node = node;
+  rec.root.className = `node ${node.type} ${node.author || ""}`
+    + (node.private ? " private" : "") + (node.shape && node.type === "box" ? ` ${node.shape}` : "")
+    + (selected === node.id ? " selected" : "");
+  rec.root.dataset.lang = node.language || "";
+  if (dragging !== node.id) place(rec);
+
+  if (rec.title && rec.title !== document.activeElement && rec.title.textContent !== node.title)
+    rec.title.textContent = node.title || "";
+  if (rec.lang && rec.lang.value !== node.language) rec.lang.value = node.language;
+  if (rec.lock) rec.lock.classList.toggle("on", Boolean(node.private));
+
+  if (rec.ta) {
+    if (document.activeElement !== rec.ta && rec.ta.value !== node.text) rec.ta.value = node.text;
+    rec.code.innerHTML = highlight(rec.ta.value, node.language);
+  }
+  if (rec.label && rec.label !== document.activeElement && rec.label.textContent !== node.text)
+    rec.label.textContent = node.text;
+  if (node.type === "diagram") paintDiagram(rec, node);
+
+  const next = stamp(node);
+  if (origin === "claude" && stamps.get(node.id) !== undefined && stamps.get(node.id) !== next) {
+    rec.root.classList.remove("pulse");
+    void rec.root.offsetWidth;
+    rec.root.classList.add("pulse");
+  }
+  stamps.set(node.id, next);
+}
+
+/* ------------------------------------------------------------------ wires */
+function edgePoint(node, towards) {
+  const cx = node.x + node.w / 2, cy = node.y + node.h / 2;
+  const dx = towards.x - cx, dy = towards.y - cy;
+  if (!dx && !dy) return { x: cx, y: cy };
+  const scale = Math.min(
+    Math.abs(dx) > 0.001 ? (node.w / 2) / Math.abs(dx) : Infinity,
+    Math.abs(dy) > 0.001 ? (node.h / 2) / Math.abs(dy) : Infinity,
+  );
+  return { x: cx + dx * scale, y: cy + dy * scale };
+}
+
+function drawWires() {
+  const layer = $("wire-layer");
+  layer.replaceChildren();
+  for (const edge of Object.values(state.edges || {})) {
+    const a = els.get(edge.from)?.node, b = els.get(edge.to)?.node;
+    if (!a || !b) continue;
+    const ca = { x: a.x + a.w / 2, y: a.y + a.h / 2 }, cb = { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+    const p1 = edgePoint(a, cb), p2 = edgePoint(b, ca);
+    const d = `M ${p1.x} ${p1.y} L ${p2.x} ${p2.y}`;
+
+    const hit = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    hit.setAttribute("d", d);
+    hit.setAttribute("class", "hit");
+    hit.addEventListener("click", () => send({ type: "user_disconnect", id: edge.id }));
+    hit.append(Object.assign(document.createElementNS("http://www.w3.org/2000/svg", "title"),
+                             { textContent: "Click to remove this line" }));
+
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    line.setAttribute("d", d);
+    line.setAttribute("marker-end", "url(#arrow)");
+    line.setAttribute("class", `${edge.author === "claude" ? "claude" : ""} ${edge.dashed ? "dashed" : ""}`);
+    layer.append(hit, line);
+
+    if (edge.label) {
+      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      text.setAttribute("x", (p1.x + p2.x) / 2);
+      text.setAttribute("y", (p1.y + p2.y) / 2 - 5);
+      text.setAttribute("text-anchor", "middle");
+      text.textContent = edge.label;
+      layer.append(text);
+    }
+  }
+}
+
+$("wires").insertAdjacentHTML("afterbegin",
+  `<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6"
+     orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>`);
+
+/* ------------------------------------------------------------ side panel */
+function renderNotes() {
+  $("notes").replaceChildren(...(state.notes || []).map((note, index) => {
+    const li = document.createElement("li");
+    li.className = note.author === "claude" ? "claude" : "user";
+    const who = document.createElement("div"); who.className = "who";
+    const txt = document.createElement("div"); txt.className = "txt"; txt.textContent = note.text;
+    const del = document.createElement("button");
+    del.className = "icon del"; del.textContent = "×"; del.title = "Remove";
+    del.addEventListener("click", () => send({ type: "user_note_delete", index }));
+    li.append(who, txt, del);
+    return li;
+  }));
+}
+
+const VERDICTS = ["strong", "mixed", "weak"];
+function renderRubric() {
+  $("rubric").replaceChildren(...(state.rubric || []).map(row => {
+    const li = document.createElement("li");
+    const line = document.createElement("div"); line.className = "row";
+    const label = document.createElement("div"); label.className = "label"; label.textContent = row.label;
+    const group = document.createElement("div"); group.className = "verdicts";
+    for (const v of VERDICTS) {
+      const b = document.createElement("button");
+      b.dataset.v = v; b.textContent = v[0].toUpperCase();
+      b.title = v;
+      b.setAttribute("aria-pressed", String(row.verdict === v));
+      b.addEventListener("click", () =>
+        send({ type: "user_rubric", label: row.label, verdict: row.verdict === v ? "unset" : v }));
+      group.append(b);
+    }
+    line.append(label, group);
+    li.append(line);
+    if (row.note) {
+      const note = document.createElement("div"); note.className = "note"; note.textContent = row.note;
+      li.append(note);
+    }
+    return li;
+  }));
+}
+
+$("note-input").addEventListener("keydown", e => {
+  if (e.key !== "Enter" || !e.target.value.trim()) return;
+  send({ type: "user_note", text: e.target.value.trim() });
+  e.target.value = "";
+});
+$("rubric-input").addEventListener("keydown", e => {
+  if (e.key !== "Enter" || !e.target.value.trim()) return;
+  send({ type: "user_rubric", label: e.target.value.trim(), verdict: "unset" });
+  e.target.value = "";
+});
+
+/* --------------------------------------------------------- board plumbing */
+let pickerSignature = "";
+function renderPicker() {
+  const saved = state.saved || [];
+  const signature = saved.map(b => b.slug + b.updated).join("|");
+  if (signature === pickerSignature) return;
+  pickerSignature = signature;
+  const sel = $("board-picker");
+  sel.replaceChildren(new Option("Saved boards…", ""),
+    ...saved.map(b => new Option(`${b.name} · ${b.nodes} items`, b.slug)));
+  sel.value = saved.some(b => b.slug === state.slug) ? state.slug : "";
+}
+
+$("board-picker").addEventListener("change", e => {
+  if (e.target.value) send({ type: "user_load", slug: e.target.value });
+});
+$("new-board").addEventListener("click", () => {
+  const name = prompt("Name for the new board");
+  if (name?.trim()) send({ type: "user_new", name: name.trim() });
+});
+$("board-name").addEventListener("change", e => send({ type: "user_rename", name: e.target.value }));
+
+/* ------------------------------------------------------------------ render */
+function render(origin) {
+  document.body.classList.toggle("host", Boolean(state.host));
+  $("host-pill").hidden = !state.host;
+  if ($("board-name") !== document.activeElement) $("board-name").value = state.name || "";
+
+  for (const [id, rec] of els) {
+    if (!state.nodes[id]) { rec.root.remove(); els.delete(id); stamps.delete(id); diagramCache.delete(id); }
+  }
+  for (const node of Object.values(state.nodes || {})) {
+    let rec = els.get(node.id);
+    if (!rec || rec.type !== node.type) {
+      rec?.root.remove();
+      rec = makeNode(node);
+      els.set(node.id, rec);
+    }
+    paint(rec, node, origin);
+  }
+
+  drawWires();
+  if (state.host) { renderNotes(); renderRubric(); }
+  renderPicker();
+  $("empty-hint").hidden = Object.keys(state.nodes || {}).length > 0;
+}
+
+applyView();
+connect();
+</script>
+</body>
+</html>

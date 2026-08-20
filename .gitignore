@@ -1,0 +1,6 @@
+venv/
+.token
+boards/
+__pycache__/
+*.tmp
+.token.host
