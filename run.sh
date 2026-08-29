@@ -38,17 +38,11 @@ if [ "$WANT_APP" = "1" ] && ! ./venv/bin/python -c "import webview" 2>/dev/null;
   ./venv/bin/pip install -q pywebview || WANT_APP=0
 fi
 
-# Two tokens. The shared one opens the board; the interviewer's one also opens
-# the private view and the MCP endpoint, so the link you hand a candidate can't
-# reach your notes or drive Claude's tools.
+# One token. Everyone who has it sees the same board.
 if [ ! -f .token ]; then
   ./venv/bin/python -c "import secrets;print(secrets.token_urlsafe(24))" > .token
 fi
-if [ ! -f .token.host ]; then
-  ./venv/bin/python -c "import secrets;print(secrets.token_urlsafe(24))" > .token.host
-fi
 export BOARD_TOKEN="$(cat .token)"
-export BOARD_HOST_TOKEN="$(cat .token.host)"
 
 # --- is a board already running? -----------------------------------------
 # Claude Desktop starts one when it launches. Binding the same port would just
@@ -56,7 +50,7 @@ export BOARD_HOST_TOKEN="$(cat .token.host)"
 # to one while you watch the other.
 find_board() {
   for candidate in $(seq "$PORT" $((PORT + 19))); do
-    if curl -s --max-time 1 "http://127.0.0.1:$candidate/health?t=$BOARD_HOST_TOKEN" \
+    if curl -s --max-time 1 "http://127.0.0.1:$candidate/health?t=$BOARD_TOKEN" \
          | grep -q '"ok":true'; then
       echo "$candidate"
       return 0
@@ -85,7 +79,7 @@ if [ "$WANT_TUNNEL" = "1" ] && command -v cloudflared >/dev/null 2>&1; then
 fi
 
 echo
-echo "  ── Interview board ─────────────────────────────────────────────"
+echo "  ── Board ───────────────────────────────────────────────────────"
 echo
 if [ -n "$OWNER" ]; then
   echo "  Attached to the board already running on port $OWNER."
@@ -97,17 +91,17 @@ echo
 if [ "$WANT_APP" = "1" ]; then
   echo "  1. Your board opens in its own window. Park it beside Claude."
 else
-  echo "  1. Open your board (this view has your private notes on it):"
-  echo "     http://127.0.0.1:$LIVE_PORT/host?t=$BOARD_HOST_TOKEN"
+  echo "  1. Open the board:"
+  echo "     http://127.0.0.1:$LIVE_PORT/?t=$BOARD_TOKEN"
 fi
 echo
 if [ -n "$TUNNEL_URL" ]; then
   echo "  2. In Claude: Customize > Connectors > + > Add custom connector"
   echo "     Paste this whole line as the URL. Leave everything else blank:"
   echo
-  echo "     $TUNNEL_URL/mcp?t=$BOARD_HOST_TOKEN"
+  echo "     $TUNNEL_URL/mcp?t=$BOARD_TOKEN"
   echo
-  echo "  3. Share this with the candidate — canvas only, no notes, no tools:"
+  echo "  3. Anyone else who should see it opens:"
   echo
   echo "     $TUNNEL_URL/?t=$BOARD_TOKEN"
 elif [ "$WANT_TUNNEL" = "0" ]; then
@@ -122,7 +116,7 @@ elif ! command -v cloudflared >/dev/null 2>&1; then
 else
   echo "  2. The tunnel didn't come up in time. Quit (Ctrl+C) and try again."
   echo
-  echo "  3. Share this with the candidate on your network:"
+  echo "  3. Anyone on your network opens:"
   echo "     http://127.0.0.1:$LIVE_PORT/?t=$BOARD_TOKEN"
 fi
 echo
@@ -133,7 +127,7 @@ echo
 open_window() {
   [ "$WANT_APP" = "1" ] || return 0
   nohup ./venv/bin/python board_mcp.py --window \
-    "http://127.0.0.1:$LIVE_PORT/host?t=$BOARD_HOST_TOKEN" >/dev/null 2>&1 &
+    "http://127.0.0.1:$LIVE_PORT/?t=$BOARD_TOKEN" >/dev/null 2>&1 &
   disown 2>/dev/null
 }
 

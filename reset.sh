@@ -39,7 +39,6 @@ if [ "${1:-}" = "--new-tokens" ]; then
   echo "  Minting new tokens..."
   rm -f .token .token.host
   ./venv/bin/python -c "import secrets;print(secrets.token_urlsafe(24))" > .token
-  ./venv/bin/python -c "import secrets;print(secrets.token_urlsafe(24))" > .token.host
   echo "    done — any old link or connector URL is now dead"
 fi
 

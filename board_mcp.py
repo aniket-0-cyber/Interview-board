@@ -71,12 +71,6 @@ def _token(filename: str, variable: str) -> str:
 # Anything not on your machine must present this.
 TOKEN = _token(".token", "BOARD_TOKEN")
 
-# The interviewer's own token. It opens /host and /mcp on top of the board
-# itself, where the shared token opens only the board. Two tokens is what makes
-# the private layer real rather than something the page politely declines to
-# render: the candidate's link cannot reach the private data or the tools.
-HOST_TOKEN = _token(".token.host", "BOARD_HOST_TOKEN")
-
 # Set once the stdio server knows which port it landed on. While it is None the
 # board is being served some other way and nothing here should open a window.
 WINDOW_URL: Optional[str] = None
@@ -168,30 +162,35 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# Footprint per node type, in board pixels. When Claude doesn't name coordinates
-# the board finds a free slot itself, so a voice-driven call never has to do
-# layout arithmetic mid-sentence.
+# Footprint per node type, in board pixels. When no coordinates are given the
+# board finds a free slot itself, so a voice-driven call never has to do layout
+# arithmetic mid-sentence.
 NODE_SIZES: Dict[str, tuple] = {
     "doc":     (460, 320),
     "diagram": (440, 300),
     "box":     (190, 96),
+    "sticky":  (170, 150),
     "text":    (220, 44),
 }
 NODE_TYPES = tuple(NODE_SIZES)
+
+# Named colours rather than hex, so "make it yellow" works out loud and the page
+# can pick shades that stay legible in both light and dark.
+COLORS = ("none", "grey", "red", "orange", "yellow", "green", "blue", "purple", "pink")
+SIZES = ("s", "m", "l")
+
 GRID_X, GRID_STEP, MARGIN, GUTTER = 500, 60, 40, 24
+HISTORY_LIMIT = 60
 
 
 class Board:
     """The board on screen: positioned nodes and the edges between them, plus
-    websocket fan-out and autosave.
+    websocket fan-out, undo history and autosave.
 
-    A node marked private belongs to the interviewer alone. It is stripped from
-    the shared projection before it ever reaches the candidate's socket, and any
-    edit naming it from a non-host connection is refused, so the private layer is
-    a property of the server rather than something the page is trusted to hide."""
+    One board, one view. Everyone connected sees exactly the same thing."""
 
     def __init__(self) -> None:
-        self._clients: Dict[WebSocket, bool] = {}      # socket -> is_host
+        self._clients: set = set()
         self._lock = asyncio.Lock()
         self._dirty = False
         self._saver: Optional[asyncio.Task] = None
@@ -204,17 +203,16 @@ class Board:
         self.slug = slugify(name)
         self.nodes: Dict[str, Dict[str, Any]] = {}
         self.edges: Dict[str, Dict[str, Any]] = {}
-        self.notes: List[Dict[str, str]] = []          # host-only
-        self.rubric: List[Dict[str, str]] = []         # host-only
         self.seq = 0
         self.rev = 0
         self.last_editor = "claude"
+        self._history: List[Dict[str, Any]] = []
+        self._future: List[Dict[str, Any]] = []
+        self._before = self.document()
 
     # ---- nodes and edges ----
 
     def _fresh_id(self) -> str:
-        """Random rather than sequential: consecutive ids would let the candidate
-        infer how many private nodes are hidden from the gaps in what they see."""
         while True:
             ident = secrets.token_hex(3)
             if ident not in self.nodes and ident not in self.edges:
@@ -243,7 +241,10 @@ class Board:
             "id": self._fresh_id(), "type": kind, "seq": self.seq,
             "x": int(x), "y": int(y), "w": int(fields.pop("w", w)), "h": int(fields.pop("h", h)),
             "title": "", "text": "", "language": "python", "shape": "rect",
-            "private": False, "author": "claude",
+            "fill": "yellow" if kind == "sticky" else "none",
+            "stroke": "grey", "size": "m", "bold": False,
+            "fitted": True,             # page may auto-size it until a human drags
+            "author": "claude",
         }
         node.update({k: v for k, v in fields.items() if v is not None})
         self.nodes[node["id"]] = node
@@ -257,43 +258,115 @@ class Board:
             del self.edges[edge_id]
         return True
 
-    def connect(self, src: str, dst: str, label: str = "", dashed: bool = False) -> Dict[str, Any]:
-        edge = {"id": self._fresh_id(), "from": src, "to": dst,
-                "label": label, "dashed": dashed, "author": "claude"}
+    def connect(self, src: str, dst: str, label: str = "", style: str = "solid",
+                color: str = "grey", width: int = 2) -> Dict[str, Any]:
+        edge = {"id": self._fresh_id(), "from": src, "to": dst, "label": label,
+                "style": style, "color": color, "width": width, "author": "claude"}
         self.edges[edge["id"]] = edge
         return edge
 
-    def arrange(self) -> None:
-        """Reflow every node onto the grid in creation order, keeping edges."""
+    # ---- layout ----
+
+    def arrange(self, layout: str = "grid") -> None:
+        if layout == "layered":
+            self._layered()
+        else:
+            self._grid()
+
+    def _grid(self) -> None:
         order = sorted(self.nodes.values(), key=lambda n: n["seq"])
         for node in order:
-            node["x"], node["y"] = -100_000, -100_000     # park it out of the way
+            node["x"], node["y"] = -100_000, -100_000
         for node in order:
             node["x"], node["y"] = self.place(node["w"], node["h"])
 
-    def readable(self, ident: str, host: bool) -> bool:
-        node = self.nodes.get(ident)
-        return bool(node) and (host or not node.get("private"))
+    def _layered(self) -> None:
+        """Rank nodes by how deep they sit in the edge graph, then lay the ranks
+        out left to right. What you want after describing a flow: the geometry
+        follows the structure instead of the order you happened to say things."""
+        depth: Dict[str, int] = {i: 0 for i in self.nodes}
+        incoming = {i: 0 for i in self.nodes}
+        for edge in self.edges.values():
+            if edge["to"] in incoming:
+                incoming[edge["to"]] += 1
 
-    # ---- persistence and projection ----
+        # longest-path ranking, with a bound so a cycle can't spin forever
+        for _ in range(len(self.nodes) + 1):
+            changed = False
+            for edge in self.edges.values():
+                a, b = edge["from"], edge["to"]
+                if a in depth and b in depth and depth[b] < depth[a] + 1:
+                    depth[b] = depth[a] + 1
+                    changed = True
+            if not changed:
+                break
+
+        ranks: Dict[int, List[Dict[str, Any]]] = {}
+        for ident, level in depth.items():
+            ranks.setdefault(level, []).append(self.nodes[ident])
+
+        x = MARGIN
+        for level in sorted(ranks):
+            column = sorted(ranks[level], key=lambda n: n["seq"])
+            width = max(n["w"] for n in column)
+            y = MARGIN
+            for node in column:
+                node["x"], node["y"] = x, y
+                y += node["h"] + GUTTER * 2
+            x += width + GUTTER * 4
+
+    # ---- undo ----
+
+    def _remember(self) -> None:
+        self._history.append(self._before)
+        del self._history[:-HISTORY_LIMIT]
+        self._future.clear()
+
+    def _restore(self, data: Dict[str, Any]) -> None:
+        rev = self.rev
+        self.adopt(data)
+        self.rev = rev
+
+    def undo(self) -> bool:
+        if not self._history:
+            return False
+        self._future.append(self.document())
+        self._restore(self._history.pop())
+        return True
+
+    def redo(self) -> bool:
+        if not self._future:
+            return False
+        self._history.append(self.document())
+        self._restore(self._future.pop())
+        return True
+
+    # ---- persistence ----
 
     def adopt(self, data: Dict[str, Any]) -> None:
-        """Replace live contents with a board loaded from disk."""
         self.name = data.get("name", "Untitled board")
         self.slug = data.get("slug", slugify(self.name))
         self.nodes = {i: dict(n) for i, n in (data.get("nodes") or {}).items()}
         self.edges = {i: dict(e) for i, e in (data.get("edges") or {}).items()}
-        self.notes = [dict(n) for n in (data.get("notes") or [])][-MAX_NOTES:]
-        self.rubric = [dict(r) for r in (data.get("rubric") or [])]
         self.seq = max([n.get("seq", 0) for n in self.nodes.values()] or [0])
         self.rev = int(data.get("rev", 0))
         self.last_editor = "claude"
+        for node in self.nodes.values():
+            node.setdefault("fill", "yellow" if node.get("type") == "sticky" else "none")
+            node.setdefault("stroke", "grey")
+            node.setdefault("size", "m")
+            node.setdefault("bold", False)
+            node.setdefault("fitted", True)
+            node.pop("private", None)            # boards from the two-view version
+        for edge in self.edges.values():
+            edge.setdefault("style", "dashed" if edge.pop("dashed", False) else "solid")
+            edge.setdefault("color", "grey")
+            edge.setdefault("width", 2)
         if not self.nodes:
             self._migrate_panes(data)
 
     def _migrate_panes(self, data: Dict[str, Any]) -> None:
-        """Boards written by the three-pane version keep opening: their code and
-        diagram become the first two nodes on the canvas."""
+        """Boards written by the three-pane version keep opening."""
         code = data.get("code") or {}
         diagram = data.get("diagram") or {}
         if (code.get("source") or "").strip():
@@ -301,75 +374,63 @@ class Board:
                           language=code.get("language") or "python")
         if (diagram.get("mermaid") or "").strip():
             self.add_node("diagram", title=diagram.get("title") or "", text=diagram["mermaid"])
-        for line in data.get("notes") or []:
-            if isinstance(line, str):
-                self.notes.append({"text": line, "at": now_iso(), "author": "claude"})
 
     def document(self) -> Dict[str, Any]:
-        """The persisted form. Private nodes and notes are saved: the file on disk
-        is the interviewer's copy, and never leaves the machine."""
         return {
             "slug": self.slug,
             "name": self.name,
             "nodes": {i: dict(n) for i, n in self.nodes.items()},
             "edges": {i: dict(e) for i, e in self.edges.items()},
-            "notes": [dict(n) for n in self.notes],
-            "rubric": [dict(r) for r in self.rubric],
             "rev": self.rev,
             "updated": now_iso(),
         }
 
-    def snapshot(self, host: bool = True) -> Dict[str, Any]:
-        """The form sent to a page. `host` decides whether the private layer is in
-        it at all — the guest projection never carries the data, so there is
-        nothing for a candidate to reveal by poking at the page."""
-        nodes = {i: {k: v for k, v in n.items() if k != "seq"}
-                 for i, n in self.nodes.items() if host or not n.get("private")}
-        edges = {i: dict(e) for i, e in self.edges.items()
-                 if e["from"] in nodes and e["to"] in nodes}
-        doc: Dict[str, Any] = {
-            "slug": self.slug, "name": self.name, "rev": self.rev,
-            "nodes": nodes, "edges": edges,
-            "last_editor": self.last_editor, "updated": now_iso(),
-            "host": host, "saved": store.index(),
-        }
-        if host:
-            doc["notes"] = [dict(n) for n in self.notes]
-            doc["rubric"] = [dict(r) for r in self.rubric]
+    def snapshot(self) -> Dict[str, Any]:
+        doc = self.document()
+        doc["nodes"] = {i: {k: v for k, v in n.items() if k != "seq"}
+                        for i, n in self.nodes.items()}
+        doc["last_editor"] = self.last_editor
+        doc["saved"] = store.index()
+        doc["can_undo"] = bool(self._history)
+        doc["can_redo"] = bool(self._future)
         return doc
 
     # ---- plumbing ----
 
-    async def add_client(self, ws: WebSocket, host: bool) -> None:
-        self._clients[ws] = host
-        await ws.send_text(json.dumps({"type": "state", "board": self.snapshot(host)}))
+    async def add_client(self, ws: WebSocket) -> None:
+        self._clients.add(ws)
+        await ws.send_text(json.dumps({"type": "state", "board": self.snapshot()}))
 
     def drop_client(self, ws: WebSocket) -> None:
-        self._clients.pop(ws, None)
+        self._clients.discard(ws)
 
-    async def commit(self, editor: str) -> Dict[str, Any]:
-        """Bump the revision, push the right projection to every open page, queue
-        an autosave."""
+    async def commit(self, editor: str, remember: bool = True) -> Dict[str, Any]:
+        """Bump the revision, push to every open page, queue an autosave.
+
+        `remember` is false for undo and redo, which move through the history
+        rather than adding to it."""
         async with self._lock:
+            if remember:
+                self._remember()
             self.rev += 1
             self.last_editor = editor
             self._dirty = True
-            views = {True: self.snapshot(True), False: self.snapshot(False)}
-        for ws, is_host in list(self._clients.items()):
+            self._before = self.document()
+            state = self.snapshot()
+        payload = json.dumps({"type": "state", "board": state, "origin": editor})
+        for ws in list(self._clients):
             try:
-                await ws.send_text(json.dumps(
-                    {"type": "state", "board": views[is_host], "origin": editor}))
+                await ws.send_text(payload)
             except Exception:
                 self.drop_client(ws)
         self._ensure_saver()
-        return views[True]
+        return state
 
     def _ensure_saver(self) -> None:
         if self._saver is None or self._saver.done():
             self._saver = asyncio.ensure_future(self._autosave_loop())
 
     async def _autosave_loop(self) -> None:
-        """Coalesce rapid edits into one write every couple of seconds."""
         while True:
             await asyncio.sleep(AUTOSAVE_SECONDS)
             if not self._dirty:
@@ -378,7 +439,7 @@ class Board:
             try:
                 store.save(self.document())
             except OSError:
-                self._dirty = True  # try again next tick
+                self._dirty = True
 
     def flush(self) -> Path:
         self._dirty = False
@@ -388,12 +449,6 @@ class Board:
     def viewers(self) -> int:
         return len(self._clients)
 
-    @property
-    def watchers(self) -> int:
-        """Shared views only — the interviewer's own window doesn't count as an
-        audience, so Claude can still be told nobody can see the board."""
-        return sum(1 for is_host in self._clients.values() if not is_host)
-
 
 board = Board()
 
@@ -402,18 +457,14 @@ def _ensure_window() -> None:
     """Open the board window the first time Claude actually touches the board.
 
     Claude Desktop starts its local servers when the app launches, and a window
-    appearing then would be a window nobody asked for. Waiting for the first tool
-    call means it shows up exactly when you start an interview.
-
-    It is a separate process on purpose: pywebview wants the main thread, and in
-    stdio mode this process's main thread belongs to the MCP loop. Tracking that
-    process rather than a flag means closing the window isn't permanent — the next
-    thing Claude draws brings it back."""
+    appearing then would be a window nobody asked for. Tracking the process rather
+    than a flag means closing the window isn't permanent — the next thing Claude
+    draws brings it back."""
     global _window_proc
     if not WINDOW_URL:
         return
     if _window_proc is not None and _window_proc.poll() is None:
-        return                       # one is already up
+        return
     try:
         _window_proc = subprocess.Popen([sys.executable, __file__, "--window", WINDOW_URL],
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -430,12 +481,9 @@ def _ack(action: str, state: Dict[str, Any], **extra: Any) -> str:
         "board": state["name"],
         "rev": state["rev"],
         "viewers": board.viewers,
-        "shared_viewers": board.watchers,
     }
     if board.viewers == 0:
         payload["note"] = "No window has the board open, so nobody can see this."
-    elif board.watchers == 0:
-        payload["note"] = "Only the interviewer's window is open; the shared view has no one in it."
     payload.update(extra)
     return json.dumps(payload)
 
@@ -448,11 +496,14 @@ def _fail(error: str, hint: str, **extra: Any) -> str:
 # Tool inputs
 # --------------------------------------------------------------------------
 #
-# Every tool takes its fields directly rather than nesting them under a single
-# model. A wrapper object reads fine in a schema but is a trap in practice: a
-# tool whose fields all have defaults looks callable with no arguments at all,
-# the wrapper goes missing, and the whole call dies on validation — which the
-# client reports as a bare "tool call failed" with nothing to act on.
+# Every tool takes its fields directly rather than nesting them under a wrapper
+# model: a tool whose fields all have defaults looks callable with no arguments,
+# the wrapper goes missing, and the call dies on validation — which the client
+# reports as a bare "tool call failed" with nothing to act on.
+#
+# Names are deliberately the same everywhere. Contents are always `text`, never
+# `label` or `source` or `mermaid`; a node is always `id`; an edge always runs
+# from_id -> to_id, matching what board_read prints back.
 
 class Language(str, Enum):
     python = "python"
@@ -478,19 +529,40 @@ class Shape(str, Enum):
     diamond = "diamond"
 
 
-class Verdict(str, Enum):
-    strong = "strong"
-    mixed = "mixed"
-    weak = "weak"
-    unset = "unset"
+class Color(str, Enum):
+    none = "none"
+    grey = "grey"
+    red = "red"
+    orange = "orange"
+    yellow = "yellow"
+    green = "green"
+    blue = "blue"
+    purple = "purple"
+    pink = "pink"
 
 
-# Shared field shapes, so the same idea reads the same way in every signature.
+class TextSize(str, Enum):
+    s = "s"
+    m = "m"
+    l = "l"
+
+
+class EdgeStyle(str, Enum):
+    solid = "solid"
+    dashed = "dashed"
+
+
+class Layout(str, Enum):
+    layered = "layered"
+    grid = "grid"
+
+
 XPos = Annotated[Optional[int], Field(description="Left edge in board pixels. Omit and the board finds a free spot.")]
 YPos = Annotated[Optional[int], Field(description="Top edge in board pixels. Omit and the board finds a free spot.")]
-Private = Annotated[bool, Field(description="True keeps it on the interviewer's view. The candidate never receives it.")]
 NodeId = Annotated[str, Field(description="Node id, from board_read or from the call that created it.",
                               min_length=1, max_length=32)]
+FillArg = Annotated[Optional[Color], Field(description="Background colour. 'none' leaves it plain.")]
+StrokeArg = Annotated[Optional[Color], Field(description="Border and text accent colour.")]
 
 
 # --------------------------------------------------------------------------
@@ -507,39 +579,43 @@ def _missing(ident: str) -> str:
                  "Call board_read with response_format=json to see the current ids.")
 
 
+def _style(**pairs: Any) -> Dict[str, Any]:
+    """Drop the styling arguments that weren't supplied, and unwrap the enums."""
+    out = {}
+    for key, value in pairs.items():
+        if value is not None:
+            out[key] = value.value if isinstance(value, Enum) else value
+    return out
+
+
 @mcp.tool(
     name="board_add_doc",
     annotations=ToolAnnotations(title="Put a document on the board", read_only_hint=False,
                                destructive_hint=False, idempotent_hint=False, open_world_hint=False),
 )
 async def board_add_doc(
-    text: Annotated[str, Field(description="Contents of the document: source code, or prose when language is markdown.",
+    text: Annotated[str, Field(description="Contents: source code, or prose when language is markdown.",
                                max_length=20000)],
     language: Annotated[Language, Field(description="Governs syntax colouring. Use markdown for prose.")] = Language.python,
-    title: Annotated[Optional[str], Field(description="Heading on the node, e.g. 'Two Sum — optimal'.",
-                                          max_length=120)] = None,
-    private: Private = False,
+    title: Annotated[Optional[str], Field(description="Heading on the node.", max_length=120)] = None,
+    fill: FillArg = None,
+    stroke: StrokeArg = None,
     x: XPos = None,
     y: YPos = None,
 ) -> str:
     """Drop a document onto the canvas: source code, or prose when language is
-    markdown. It sits wherever you put it and the user can drag, resize and type
-    into it — there is no fixed code pane any more, so a board can hold several
-    documents side by side (a brief, an attempt, a rewrite).
+    markdown. It can be dragged, resized and typed into, and a board can hold as
+    many as you like side by side.
 
-    Set private=true for something only the interviewer should see: a model answer
-    to compare against, the hints you are holding back, a follow-up you plan to ask.
-    The candidate's view never receives it.
-
-    For small edits mid-discussion prefer board_patch_doc, so the user's eye doesn't
-    lose its place.
+    For small edits mid-discussion prefer board_patch_doc, so the reader's eye
+    doesn't lose its place.
 
     Returns: JSON {ok, action, id, board, rev, viewers, note?}. Keep the id — you
     need it for board_patch_doc, board_connect and board_move.
     """
-    node = board.add_node("doc", text=text, language=language.value,
-                          title=title, private=private, x=x, y=y)
-    return _ack("add_doc", await board.commit("claude"), id=node["id"], private=node["private"])
+    node = board.add_node("doc", text=text, language=language.value, title=title,
+                          x=x, y=y, **_style(fill=fill, stroke=stroke))
+    return _ack("add_doc", await board.commit("claude"), id=node["id"])
 
 
 @mcp.tool(
@@ -594,23 +670,45 @@ async def board_patch_doc(
                                destructive_hint=False, idempotent_hint=False, open_world_hint=False),
 )
 async def board_add_box(
-    label: Annotated[str, Field(description="Text inside the box. Keep it to a few words.", max_length=200)],
+    text: Annotated[str, Field(description="Text inside the box. Keep it to a few words.", max_length=200)],
     shape: Annotated[Shape, Field(description="Box outline.")] = Shape.rect,
-    private: Private = False,
+    fill: FillArg = None,
+    stroke: StrokeArg = None,
     x: XPos = None,
     y: YPos = None,
 ) -> str:
     """Put one labelled box on the canvas — a service, a queue, a table, a stage.
+    The box grows to fit its text.
 
-    Build system-design sketches out of these plus board_connect when the layout
-    matters or the user is going to rearrange it by hand. When you just need a
-    structure drawn quickly and nobody will move it, board_draw_diagram is fewer
-    calls.
+    Building a whole diagram? Use board_apply instead: one call for every box and
+    line at once, laid out for you, rather than a dozen calls and hand-computed
+    coordinates.
 
     Returns: JSON {ok, action, id, board, rev, viewers, note?}.
     """
-    node = board.add_node("box", text=label, shape=shape.value, private=private, x=x, y=y)
+    node = board.add_node("box", text=text, shape=shape.value, x=x, y=y,
+                          **_style(fill=fill, stroke=stroke))
     return _ack("add_box", await board.commit("claude"), id=node["id"])
+
+
+@mcp.tool(
+    name="board_add_sticky",
+    annotations=ToolAnnotations(title="Add a sticky note", read_only_hint=False,
+                               destructive_hint=False, idempotent_hint=False, open_world_hint=False),
+)
+async def board_add_sticky(
+    text: Annotated[str, Field(description="What the sticky says. A line or two.", max_length=600)],
+    fill: Annotated[Color, Field(description="Sticky colour. Cluster related ideas by colour.")] = Color.yellow,
+    x: XPos = None,
+    y: YPos = None,
+) -> str:
+    """Add a sticky note — smaller and softer than a box, meant for clustering
+    ideas, questions and observations rather than naming parts of a system.
+
+    Returns: JSON {ok, action, id, board, rev, viewers, note?}.
+    """
+    node = board.add_node("sticky", text=text, fill=fill.value, x=x, y=y)
+    return _ack("add_sticky", await board.commit("claude"), id=node["id"])
 
 
 @mcp.tool(
@@ -620,16 +718,19 @@ async def board_add_box(
 )
 async def board_add_text(
     text: Annotated[str, Field(description="A free-floating label on the canvas.", max_length=400)],
-    private: Private = False,
+    size: Annotated[TextSize, Field(description="Text size: s, m, or l. Use l for headings.")] = TextSize.m,
+    bold: Annotated[bool, Field(description="Bold the text.")] = False,
+    stroke: StrokeArg = None,
     x: XPos = None,
     y: YPos = None,
 ) -> str:
-    """Add a bare line of text to the canvas — a heading over a cluster, a constraint
-    written where it can be pointed at, a question left up while the user thinks.
+    """Add a bare line of text — a heading over a cluster, a constraint written
+    where it can be pointed at, a question left up while someone thinks.
 
     Returns: JSON {ok, action, id, board, rev, viewers, note?}.
     """
-    node = board.add_node("text", text=text, private=private, x=x, y=y)
+    node = board.add_node("text", text=text, size=size.value, bold=bold, x=x, y=y,
+                          **_style(stroke=stroke))
     return _ack("add_text", await board.commit("claude"), id=node["id"])
 
 
@@ -639,24 +740,22 @@ async def board_add_text(
                                destructive_hint=False, idempotent_hint=False, open_world_hint=False),
 )
 async def board_draw_diagram(
-    mermaid: Annotated[str, Field(
-        description="Mermaid source, e.g. 'graph TD; A[Client]-->B[API];'. Rendered as one node on the canvas.",
+    text: Annotated[str, Field(
+        description="Mermaid source, e.g. 'graph TD; A[Client]-->B[API];'. Rendered as one node.",
         max_length=8000)],
     title: Annotated[Optional[str], Field(description="Heading on the node.", max_length=120)] = None,
-    private: Private = False,
     x: XPos = None,
     y: YPos = None,
 ) -> str:
-    """Render a Mermaid diagram as one node on the canvas — recursion trees, call
-    stacks, state machines, table schemas, system-design boxes.
+    """Render a Mermaid diagram as one node — recursion trees, call stacks, state
+    machines, table schemas, sequence diagrams.
 
-    This is your fast path: one call gets a laid-out diagram, where the same picture
-    in boxes and lines would be a dozen. The trade is that it renders as a single
-    unit, so the user can move the whole node but not drag one box out of it.
+    Use this when the picture is illustration and nobody will rearrange it. Use
+    board_apply when the boxes are the subject and someone will want to drag them.
 
     Returns: JSON {ok, action, id, board, rev, viewers, note?}.
     """
-    node = board.add_node("diagram", text=mermaid, title=title, private=private, x=x, y=y)
+    node = board.add_node("diagram", text=text, title=title, x=x, y=y)
     return _ack("draw_diagram", await board.commit("claude"), id=node["id"])
 
 
@@ -666,72 +765,156 @@ async def board_draw_diagram(
                                destructive_hint=False, idempotent_hint=False, open_world_hint=False),
 )
 async def board_connect(
-    source: Annotated[str, Field(description="Node id the line starts at.", min_length=1, max_length=32)],
-    target: Annotated[str, Field(description="Node id the line ends at.", min_length=1, max_length=32)],
-    label: Annotated[Optional[str], Field(description="Short text on the line.", max_length=80)] = None,
-    dashed: Annotated[bool, Field(description="Dashed rather than solid.")] = False,
+    from_id: Annotated[str, Field(description="Node id the line starts at.", min_length=1, max_length=32)],
+    to_id: Annotated[str, Field(description="Node id the line ends at.", min_length=1, max_length=32)],
+    text: Annotated[Optional[str], Field(description="Short label on the line.", max_length=80)] = None,
+    style: Annotated[EdgeStyle, Field(description="Solid or dashed.")] = EdgeStyle.solid,
+    color: Annotated[Color, Field(description="Line colour.")] = Color.grey,
+    width: Annotated[int, Field(description="Line thickness in pixels, 1 to 8.", ge=1, le=8)] = 2,
 ) -> str:
-    """Draw a line from one node to another. The line follows them when either is
-    dragged, so the sketch survives the user rearranging it.
+    """Draw a line from one node to another. It follows them when either is
+    dragged, so the sketch survives being rearranged.
 
     Returns: JSON {ok, action, id, board, rev, viewers} or {ok: false, error, hint}.
     """
-    for ident in (source, target):
+    for ident in (from_id, to_id):
         if ident not in board.nodes:
             return _missing(ident)
-    if source == target:
-        return _fail("A line needs two different nodes.", "Pass distinct source and target ids.")
-
-    src, dst = board.nodes[source], board.nodes[target]
-    if src.get("private") != dst.get("private"):
-        return _fail("That line would cross between the shared board and the private one.",
-                     "Connect two shared nodes or two private ones. board_update can move a node across.")
-
-    edge = board.connect(source, target, label or "", dashed)
+    if from_id == to_id:
+        return _fail("A line needs two different nodes.", "Pass distinct from_id and to_id.")
+    edge = board.connect(from_id, to_id, text or "", style.value, color.value, width)
     return _ack("connect", await board.commit("claude"), id=edge["id"])
 
 
 @mcp.tool(
+    name="board_apply",
+    annotations=ToolAnnotations(title="Build a whole diagram at once", read_only_hint=False,
+                               destructive_hint=False, idempotent_hint=False, open_world_hint=False),
+)
+async def board_apply(
+    nodes: Annotated[List[Dict[str, Any]], Field(description=(
+        "Nodes to create. Each is an object: {\"key\": \"api\", \"kind\": \"box\", \"text\": \"API\"} "
+        "where key is yours to name and is what the edges below refer to. kind is box, sticky, text, "
+        "doc or diagram (default box). Optional: fill, stroke, shape, size, bold, title, language, x, y."
+    ))],
+    edges: Annotated[Optional[List[Dict[str, Any]]], Field(description=(
+        "Lines to draw. Each is {\"from\": \"api\", \"to\": \"db\", \"text\": \"writes\"} where from and to "
+        "are keys from `nodes` above, or ids of nodes already on the board. "
+        "Optional: style (solid/dashed), color, width."
+    ))] = None,
+    layout: Annotated[Layout, Field(
+        description="layered follows the arrows and is what you want for a flow; grid just tidies.")] = Layout.layered,
+    replace: Annotated[bool, Field(description="Clear the board first, rather than adding to it.")] = False,
+) -> str:
+    """Build an entire diagram in one call, laid out for you.
+
+    This is the tool to reach for whenever you're drawing more than one thing.
+    A flowchart that would be fifteen separate calls with hand-computed
+    coordinates is one call here, and the layout follows the arrows rather than
+    the order you happened to mention things.
+
+    Returns: JSON {ok, action, ids: {your key -> node id}, nodes, edges, board,
+    rev, viewers} or {ok: false, error, hint}.
+    """
+    if not nodes:
+        return _fail("No nodes given.", "Pass at least one node, e.g. [{\"key\":\"a\",\"text\":\"Start\"}].")
+    if len(nodes) > MAX_NODES:
+        return _fail(f"{len(nodes)} nodes is more than the board holds ({MAX_NODES}).",
+                     "Split it across a couple of calls, or raise MAX_NODES.")
+
+    if replace:
+        board.nodes, board.edges = {}, {}
+
+    made: Dict[str, str] = {}
+    for index, spec in enumerate(nodes):
+        if not isinstance(spec, dict):
+            return _fail(f"Node {index} is not an object.", "Each node is {\"key\": ..., \"text\": ...}.")
+        kind = str(spec.get("kind") or "box")
+        if kind not in NODE_TYPES:
+            return _fail(f"Node {index} has kind {kind!r}.",
+                         f"Use one of: {', '.join(NODE_TYPES)}.")
+        fields = {k: spec[k] for k in
+                  ("text", "title", "language", "shape", "fill", "stroke", "size", "bold", "x", "y")
+                  if k in spec}
+        for key in ("fill", "stroke"):
+            if key in fields and fields[key] not in COLORS:
+                return _fail(f"Node {index} has {key}={fields[key]!r}.",
+                             f"Colours are: {', '.join(COLORS)}.")
+        node = board.add_node(kind, **fields)
+        made[str(spec.get("key", node["id"]))] = node["id"]
+
+    def resolve(ref: Any) -> Optional[str]:
+        ref = str(ref)
+        if ref in made:
+            return made[ref]
+        return ref if ref in board.nodes else None
+
+    drawn = 0
+    for index, spec in enumerate(edges or []):
+        if not isinstance(spec, dict):
+            return _fail(f"Edge {index} is not an object.", "Each edge is {\"from\": ..., \"to\": ...}.")
+        src, dst = resolve(spec.get("from")), resolve(spec.get("to"))
+        if src is None or dst is None:
+            return _fail(f"Edge {index} points at something that doesn't exist "
+                         f"({spec.get('from')!r} -> {spec.get('to')!r}).",
+                         "Use a key from `nodes`, or the id of a node already on the board.",
+                         keys=sorted(made))
+        if src == dst:
+            continue
+        board.connect(src, dst, str(spec.get("text") or ""),
+                      str(spec.get("style") or "solid"),
+                      str(spec.get("color") or "grey"),
+                      int(spec.get("width") or 2))
+        drawn += 1
+
+    board.arrange(layout.value)
+    return _ack("apply", await board.commit("claude"),
+                ids=made, nodes=len(made), edges=drawn)
+
+
+@mcp.tool(
     name="board_update",
-    annotations=ToolAnnotations(title="Change a node", read_only_hint=False,
+    annotations=ToolAnnotations(title="Change or restyle nodes", read_only_hint=False,
                                destructive_hint=True, idempotent_hint=True, open_world_hint=False),
 )
 async def board_update(
-    id: NodeId,
+    id: Annotated[Optional[str], Field(description="One node id.", max_length=32)] = None,
+    ids: Annotated[Optional[List[str]], Field(
+        description="Several node ids, to restyle them together in one call.")] = None,
     text: Annotated[Optional[str], Field(description="Replace the node's contents.", max_length=20000)] = None,
     title: Annotated[Optional[str], Field(description="Replace the heading.", max_length=120)] = None,
     language: Annotated[Optional[Language], Field(description="Change syntax colouring on a doc.")] = None,
-    private: Annotated[Optional[bool], Field(
-        description="Move the node between the shared view and the interviewer's.")] = None,
+    fill: FillArg = None,
+    stroke: StrokeArg = None,
+    size: Annotated[Optional[TextSize], Field(description="Text size: s, m or l.")] = None,
+    bold: Annotated[Optional[bool], Field(description="Bold the text.")] = None,
+    shape: Annotated[Optional[Shape], Field(description="Box outline.")] = None,
 ) -> str:
-    """Replace a node's contents, heading or language, or move it between the shared
-    board and the interviewer's private layer.
+    """Change what a node says, or how it looks.
 
-    Flipping private is how you reveal something you were holding: set private=false
-    on a model answer and it appears on the candidate's screen at that moment.
+    Pass `ids` instead of `id` to restyle a group in one call — colour-coding six
+    boxes is one call, not six.
 
-    Returns: JSON {ok, action, id, board, rev, viewers} or {ok: false, error, hint}.
+    Returns: JSON {ok, action, ids, board, rev, viewers} or {ok: false, error, hint}.
     """
-    node = board.nodes.get(id)
-    if node is None:
-        return _missing(id)
+    targets = [i for i in ([id] if id else []) + list(ids or []) if i]
+    if not targets:
+        return _fail("No node named.", "Pass id for one node, or ids for several.")
 
-    if text is not None:
-        node["text"] = text
-    if title is not None:
-        node["title"] = title
-    if language is not None:
-        node["language"] = language.value
-    if private is not None and private != node["private"]:
-        node["private"] = private
-        # A line may not straddle the two layers, so drop any that now would.
-        for edge_id, edge in list(board.edges.items()):
-            if id in (edge["from"], edge["to"]):
-                other = board.nodes.get(edge["to"] if edge["from"] == id else edge["from"])
-                if other is not None and other["private"] != private:
-                    del board.edges[edge_id]
-    node["author"] = "claude"
-    return _ack("update", await board.commit("claude"), id=node["id"], private=node["private"])
+    changes = _style(text=text, title=title, language=language, fill=fill,
+                     stroke=stroke, size=size, bold=bold, shape=shape)
+    if not changes:
+        return _fail("Nothing to change.", "Pass at least one of text, title, fill, stroke, size, bold, shape.")
+
+    touched = []
+    for ident in targets:
+        node = board.nodes.get(ident)
+        if node is None:
+            return _missing(ident)
+        node.update(changes)
+        node["author"] = "claude"
+        touched.append(ident)
+    return _ack("update", await board.commit("claude"), ids=touched)
 
 
 @mcp.tool(
@@ -744,9 +927,11 @@ async def board_move(
     x: Annotated[int, Field(description="New left edge in board pixels.")],
     y: Annotated[int, Field(description="New top edge in board pixels.")],
 ) -> str:
-    """Reposition a node — "put the diagram next to the code", "move that out of the
-    way". Coordinates are board pixels with the origin at the top left; board_read
-    with response_format=json gives you everything's current position.
+    """Reposition a node. Coordinates are board pixels with the origin top left;
+    board_read with response_format=json gives you everything's position.
+
+    For anything more than a nudge, board_arrange or board_apply will lay the
+    whole board out better than coordinates picked by hand.
 
     Returns: JSON {ok, action, id, board, rev, viewers} or {ok: false, error, hint}.
     """
@@ -754,97 +939,89 @@ async def board_move(
     if node is None:
         return _missing(id)
     node["x"], node["y"] = x, y
+    node["fitted"] = False
     return _ack("move", await board.commit("claude"), id=node["id"])
 
 
 @mcp.tool(
     name="board_remove",
-    annotations=ToolAnnotations(title="Remove a node or line", read_only_hint=False,
+    annotations=ToolAnnotations(title="Remove nodes or lines", read_only_hint=False,
                                destructive_hint=True, idempotent_hint=True, open_world_hint=False),
 )
 async def board_remove(
-    id: Annotated[str, Field(description="Id of the node or line to remove. Removing a node removes its lines too.",
-                             min_length=1, max_length=32)],
+    id: Annotated[Optional[str], Field(description="Id of one node or line.", max_length=32)] = None,
+    ids: Annotated[Optional[List[str]], Field(description="Several ids, removed together.")] = None,
 ) -> str:
-    """Take one node off the board, along with any lines touching it. Also removes a
-    line when given a line's id.
+    """Take nodes off the board, along with any lines touching them. Also removes
+    a line when given a line's id.
 
-    Returns: JSON {ok, action, id, board, rev, viewers} or {ok: false, error, hint}.
+    Returns: JSON {ok, action, removed, board, rev, viewers} or {ok: false, error, hint}.
     """
-    if id in board.edges:
-        del board.edges[id]
-        return _ack("remove_line", await board.commit("claude"), id=id)
-    if board.remove_node(id):
-        return _ack("remove_node", await board.commit("claude"), id=id)
-    return _missing(id)
+    targets = [i for i in ([id] if id else []) + list(ids or []) if i]
+    if not targets:
+        return _fail("Nothing named.", "Pass id for one, or ids for several.")
+    removed = []
+    for ident in targets:
+        if ident in board.edges:
+            del board.edges[ident]
+            removed.append(ident)
+        elif board.remove_node(ident):
+            removed.append(ident)
+        else:
+            return _missing(ident)
+    return _ack("remove", await board.commit("claude"), removed=removed)
 
 
 @mcp.tool(
     name="board_arrange",
-    annotations=ToolAnnotations(title="Tidy the layout", read_only_hint=False,
+    annotations=ToolAnnotations(title="Lay the board out", read_only_hint=False,
                                destructive_hint=False, idempotent_hint=True, open_world_hint=False),
 )
-async def board_arrange() -> str:
-    """Reflow everything onto a tidy grid in the order it was created, keeping all
-    lines. Use when the canvas has drifted into a mess and the user says so.
+async def board_arrange(
+    layout: Annotated[Layout, Field(
+        description="layered follows the arrows; grid just tidies into columns.")] = Layout.layered,
+) -> str:
+    """Lay every node out again, keeping all lines.
 
-    Returns: JSON {ok, action, board, rev, viewers, nodes}.
+    layered ranks nodes by how deep they sit in the graph and puts each rank in
+    its own column, so a flow reads left to right however it was built. grid
+    ignores the arrows and just packs things tidily.
+
+    Returns: JSON {ok, action, board, rev, viewers, nodes, layout}.
     """
-    board.arrange()
-    return _ack("arrange", await board.commit("claude"), nodes=len(board.nodes))
+    board.arrange(layout.value)
+    return _ack("arrange", await board.commit("claude"),
+                nodes=len(board.nodes), layout=layout.value)
 
 
 @mcp.tool(
-    name="board_note",
-    annotations=ToolAnnotations(title="Write a private note", read_only_hint=False,
-                               destructive_hint=False, idempotent_hint=False, open_world_hint=False),
+    name="board_undo",
+    annotations=ToolAnnotations(title="Undo the last change", read_only_hint=False,
+                               destructive_hint=True, idempotent_hint=False, open_world_hint=False),
 )
-async def board_note(
-    text: Annotated[str, Field(description="One short line: an observation, a hint you gave, a concern.",
-                               min_length=1, max_length=400)],
-) -> str:
-    """Append one line to the interviewer's private notes — an observation, a hint you
-    just gave, a concern to come back to.
+async def board_undo() -> str:
+    """Step the whole board back one change — yours or anyone else's.
 
-    Notes live on the interviewer's view alone. They are never sent to the shared
-    board, so this is safe to call while the candidate is looking at the screen.
-
-    Returns: JSON {ok, action, board, rev, viewers, notes}.
+    Returns: JSON {ok, action, board, rev, viewers} or {ok: false, error, hint}.
     """
-    board.notes.append({"text": text, "at": now_iso(), "author": "claude"})
-    del board.notes[:-MAX_NOTES]
-    return _ack("note", await board.commit("claude"), notes=len(board.notes))
+    if not board.undo():
+        return _fail("Nothing to undo.", "This is as far back as the history goes.")
+    return _ack("undo", await board.commit("claude", remember=False))
 
 
 @mcp.tool(
-    name="board_rubric",
-    annotations=ToolAnnotations(title="Score a rubric line", read_only_hint=False,
-                               destructive_hint=False, idempotent_hint=True, open_world_hint=False),
+    name="board_redo",
+    annotations=ToolAnnotations(title="Redo the last undo", read_only_hint=False,
+                               destructive_hint=True, idempotent_hint=False, open_world_hint=False),
 )
-async def board_rubric(
-    label: Annotated[str, Field(description="What is being judged, e.g. 'Edge cases' or 'Complexity analysis'.",
-                                min_length=1, max_length=80)],
-    verdict: Annotated[Verdict, Field(description="Where the candidate currently stands.")] = Verdict.unset,
-    note: Annotated[Optional[str], Field(description="One line of evidence for the verdict.",
-                                         max_length=300)] = None,
-) -> str:
-    """Set where the candidate stands on one dimension. Calling it again with the
-    same label updates that line rather than adding a second one, so you can revise
-    a verdict as the interview goes.
+async def board_redo() -> str:
+    """Put back what board_undo just took away.
 
-    Private to the interviewer's view, like notes.
-
-    Returns: JSON {ok, action, board, rev, viewers, rubric}.
+    Returns: JSON {ok, action, board, rev, viewers} or {ok: false, error, hint}.
     """
-    row = next((r for r in board.rubric if r["label"].lower() == label.lower()), None)
-    if row is None:
-        row = {"label": label, "verdict": "unset", "note": ""}
-        board.rubric.append(row)
-    row["verdict"] = verdict.value
-    if note is not None:
-        row["note"] = note
-    row["at"] = now_iso()
-    return _ack("rubric", await board.commit("claude"), rubric=len(board.rubric))
+    if not board.redo():
+        return _fail("Nothing to redo.", "Nothing has been undone, or the board changed since.")
+    return _ack("redo", await board.commit("claude", remember=False))
 
 
 @mcp.tool(
@@ -852,25 +1029,15 @@ async def board_rubric(
     annotations=ToolAnnotations(title="Clear the board", read_only_hint=False,
                                destructive_hint=True, idempotent_hint=True, open_world_hint=False),
 )
-async def board_clear(
-    keep_notes: Annotated[bool, Field(description="Keep the interviewer's notes and rubric when clearing.")] = False,
-    keep_private: Annotated[bool, Field(description="Keep private nodes, clearing only the shared canvas.")] = False,
-) -> str:
-    """Empty the canvas, keeping the same board name and file.
+async def board_clear() -> str:
+    """Empty the canvas, keeping the same board name and file. Undoable.
 
-    To start a genuinely separate problem use board_new instead — that preserves the
-    current board on disk under its own name.
+    To start a genuinely separate subject use board_new instead — that preserves
+    the current board on disk under its own name.
 
     Returns: JSON {ok, action, board, rev, viewers, note?}.
     """
-    if keep_private:
-        board.nodes = {i: n for i, n in board.nodes.items() if n.get("private")}
-        board.edges = {i: e for i, e in board.edges.items()
-                       if e["from"] in board.nodes and e["to"] in board.nodes}
-    else:
-        board.nodes, board.edges = {}, {}
-    if not keep_notes:
-        board.notes, board.rubric = [], []
+    board.nodes, board.edges = {}, {}
     return _ack("clear", await board.commit("claude"))
 
 
@@ -887,24 +1054,22 @@ def _describe(state: Dict[str, Any]) -> str:
         lines.append("\nThe canvas is empty.")
 
     for node in [n for n in nodes if n["type"] == "doc"]:
-        tag = " · private" if node.get("private") else ""
-        head = node["title"] or "Document"
-        lines += [f"\n## {head} [{node['id']}] ({node['language']}{tag})",
+        lines += [f"\n## {node['title'] or 'Document'} [{node['id']}] ({node['language']})",
                   f"```{node['language']}", node["text"], "```"]
 
     for node in [n for n in nodes if n["type"] == "diagram"]:
-        tag = " · private" if node.get("private") else ""
-        lines += [f"\n## {node['title'] or 'Diagram'} [{node['id']}]{tag}",
+        lines += [f"\n## {node['title'] or 'Diagram'} [{node['id']}]",
                   "```mermaid", node["text"], "```"]
 
-    shapes = [n for n in nodes if n["type"] in ("box", "text")]
+    shapes = [n for n in nodes if n["type"] in ("box", "sticky", "text")]
     if shapes:
         lines.append("\n## Shapes")
         for node in shapes:
-            tag = " · private" if node.get("private") else ""
-            kind = node["shape"] if node["type"] == "box" else "label"
+            kind = {"box": node["shape"], "sticky": "sticky", "text": "label"}[node["type"]]
+            paint = [f"{k}={node[k]}" for k in ("fill", "stroke") if node.get(k) not in (None, "none", "grey")]
+            extra = f" [{', '.join(paint)}]" if paint else ""
             lines.append(f"- [{node['id']}] {kind}: {node['text']}"
-                         f" (at {node['x']},{node['y']}){tag}")
+                         f" (at {node['x']},{node['y']}){extra}")
 
     if state["edges"]:
         lines.append("\n## Lines")
@@ -912,17 +1077,8 @@ def _describe(state: Dict[str, Any]) -> str:
             src = state["nodes"].get(edge["from"], {}).get("text", "")[:30]
             dst = state["nodes"].get(edge["to"], {}).get("text", "")[:30]
             label = f' "{edge["label"]}"' if edge["label"] else ""
-            lines.append(f"- [{edge['from']}] {src} -> [{edge['to']}] {dst}{label}")
-
-    if state.get("notes"):
-        lines.append("\n## Private notes (interviewer only)")
-        lines += [f"- {n['text']}" for n in state["notes"]]
-
-    if state.get("rubric"):
-        lines.append("\n## Rubric (interviewer only)")
-        for row in state["rubric"]:
-            note = f" — {row['note']}" if row.get("note") else ""
-            lines.append(f"- {row['label']}: {row['verdict']}{note}")
+            lines.append(f"- [{edge['id']}] from_id={edge['from']} ({src}) "
+                         f"-> to_id={edge['to']} ({dst}){label}")
 
     return "\n".join(lines)
 
@@ -934,28 +1090,21 @@ def _describe(state: Dict[str, Any]) -> str:
 )
 async def board_read(
     response_format: Annotated[ResponseFormat, Field(
-        description="markdown to read it back out loud, json when you need node ids and coordinates.",
+        description="markdown to read it back out loud, json when you need ids, colours and coordinates.",
     )] = ResponseFormat.markdown,
-    include_private: Annotated[bool, Field(
-        description="Include the interviewer's private nodes, notes and rubric.")] = True,
 ) -> str:
-    """Read the whole canvas, including everything the user typed or dragged themselves.
+    """Read the whole canvas, including everything anyone typed or dragged.
 
-    Call this whenever the user refers to what is on screen — "take a look", "is this
-    right", "I've finished", "review my solution". You have no ambient view of the
-    board; this call is the only way to see their edits.
-
-    Ask for json when you need node ids and coordinates — to patch a specific
-    document, connect two boxes, or move something. markdown is easier to read back
-    out loud.
+    Call this whenever someone refers to what is on screen — "take a look", "is
+    this right", "I've finished". You have no ambient view of the board; this
+    call is the only way to see their edits.
 
     Takes no required arguments: calling it with none at all reads the whole board.
 
-    Returns: markdown describing every node, line, note and rubric row, or JSON
-    {slug, name, rev, nodes{}, edges{}, notes[], rubric[], last_editor, saved[]}.
+    Returns: markdown describing every node and line, or JSON
+    {slug, name, rev, nodes{}, edges{}, last_editor, saved[], can_undo, can_redo}.
     """
-    _ensure_window()
-    state = board.snapshot(host=include_private)
+    state = board.snapshot()
     if response_format is ResponseFormat.json:
         return json.dumps(state, indent=2)
     return _describe(state)
@@ -967,14 +1116,15 @@ async def board_read(
                                destructive_hint=False, idempotent_hint=True, open_world_hint=False),
 )
 async def board_list() -> str:
-    """List every board saved on the user's machine, newest first.
+    """List every board saved on this machine, newest first.
 
-    Use before board_load when the user is vague about which board they want, so you
-    can offer the names out loud rather than guessing.
+    Use before board_load when someone is vague about which board they want, so
+    you can offer the names out loud rather than guessing.
 
-    Returns: JSON {count, active, boards: [{slug, name, nodes, notes, updated}]}.
+    Returns: JSON {count, active, boards: [{slug, name, nodes, updated}]}.
     """
-    return json.dumps({"count": len(store.index()), "active": board.slug, "boards": store.index()}, indent=2)
+    return json.dumps({"count": len(store.index()), "active": board.slug,
+                       "boards": store.index()}, indent=2)
 
 
 # --------------------------------------------------------------------------
@@ -987,13 +1137,13 @@ async def board_list() -> str:
                                destructive_hint=False, idempotent_hint=False, open_world_hint=False),
 )
 async def board_new(
-    name: Annotated[str, Field(description="Name for the new board, e.g. 'Two Sum' or 'Design a URL shortener'.",
+    name: Annotated[str, Field(description="Name for the new board, e.g. 'Payments redesign'.",
                                min_length=1, max_length=120)],
 ) -> str:
     """Save the current board, then start a fresh empty one under a new name.
 
-    This is the safe way to move between problems — nothing is lost, and the old
-    board can be reopened later with board_load.
+    The safe way to move between subjects — nothing is lost, and the old board
+    can be reopened later with board_load.
 
     Returns: JSON {ok, action, board, rev, viewers, previous, slug}.
     """
@@ -1013,13 +1163,13 @@ async def board_new(
 )
 async def board_save(
     name: Annotated[Optional[str], Field(
-        description="Save under a new name. Omit to save the board where it already lives.",
+        description="Save under a new name. Omit to save where it already lives.",
         max_length=120)] = None,
 ) -> str:
     """Write the board to disk now.
 
-    Boards autosave every couple of seconds, so this is mainly for 'save as': pass a
-    name to fork the current contents under it, leaving the original file untouched.
+    Boards autosave every couple of seconds, so this is mainly for 'save as':
+    pass a name to fork the current contents, leaving the original untouched.
 
     Returns: JSON {ok, action, board, rev, viewers, slug, path}.
     """
@@ -1044,21 +1194,20 @@ async def board_load(
 ) -> str:
     """Open a saved board, replacing what is currently on screen.
 
-    The current board is saved first, so nothing is lost. Partial names match, and an
-    ambiguous name returns the candidates instead of guessing — read them out and ask.
+    The current board is saved first, so nothing is lost. Partial names match, and
+    an ambiguous name returns the candidates instead of guessing.
 
-    Returns: JSON {ok, action, board, rev, viewers, slug} or {ok: false, error, hint,
-    candidates?}.
+    Returns: JSON {ok, action, board, rev, viewers, slug} or {ok: false, error,
+    hint, candidates?}.
     """
     matches = store.resolve(name)
     if not matches:
-        available = [b["name"] for b in store.index()]
         return _fail(f"No saved board matching '{name}'.",
                      "Call board_list to see what exists, or board_new to start one.",
-                     available=available)
+                     available=[b["name"] for b in store.index()])
     if len(matches) > 1:
         return _fail(f"'{name}' matches {len(matches)} boards.",
-                     "Read the candidates to the user and ask which one they mean.",
+                     "Read the candidates out and ask which one they mean.",
                      candidates=matches)
 
     data = store.load(matches[0])
@@ -1068,8 +1217,7 @@ async def board_load(
     if board.rev > 0 and board.slug != matches[0]:
         board.flush()
     board.adopt(data)
-    state = await board.commit("claude")
-    return _ack("load", state, slug=board.slug)
+    return _ack("load", await board.commit("claude"), slug=board.slug)
 
 
 @mcp.tool(
@@ -1078,11 +1226,11 @@ async def board_load(
                                destructive_hint=True, idempotent_hint=True, open_world_hint=False),
 )
 async def board_delete(
-    name: Annotated[str, Field(description="Name or slug of the board to delete. Must match exactly one board.",
+    name: Annotated[str, Field(description="Name or slug of the board to delete. Must match exactly one.",
                                min_length=1, max_length=120)],
     confirm: Annotated[bool, Field(description="Must be true. Ask the user out loud before setting this.")],
 ) -> str:
-    """Permanently delete a saved board file. Confirm with the user out loud first.
+    """Permanently delete a saved board file. Confirm out loud first.
 
     Returns: JSON {ok, action, deleted} or {ok: false, error, hint, candidates?}.
     """
@@ -1091,13 +1239,12 @@ async def board_delete(
     matches = store.resolve(name)
     if len(matches) != 1:
         return _fail(f"'{name}' matches {len(matches)} boards; need exactly one.",
-                     "Call board_list and confirm the exact name with the user.",
-                     candidates=matches)
+                     "Call board_list and confirm the exact name.", candidates=matches)
     if matches[0] == board.slug:
         return _fail("That board is currently open.",
                      "Switch away with board_new or board_load first, then delete it.")
     store.delete(matches[0])
-    await board.commit("claude")  # refresh the browser's saved-board list
+    await board.commit("claude")
     return json.dumps({"ok": True, "action": "delete", "deleted": matches[0]})
 
 
@@ -1105,68 +1252,83 @@ async def board_delete(
 # Web surface
 # --------------------------------------------------------------------------
 
-def _is_host(scope: Dict[str, Any]) -> bool:
-    return scope.get("board_role") == "host"
-
-
 async def page(_request) -> FileResponse:
-    return FileResponse(PAGE)
-
-
-async def host_page(request) -> Any:
-    """The interviewer's view. Same canvas, plus the private layer. Guarded by its
-    own token so handing the shared link to a candidate hands them nothing else."""
-    if not _is_host(request.scope):
-        return PlainTextResponse("This view needs the interviewer token.", status_code=403)
     return FileResponse(PAGE)
 
 
 async def health(_request) -> JSONResponse:
     return JSONResponse({"ok": True, "board": board.slug, "rev": board.rev,
-                         "viewers": board.viewers, "shared_viewers": board.watchers,
-                         "saved": len(store.index())})
+                         "viewers": board.viewers, "saved": len(store.index())})
+
+
+def _clean(value: Any, allowed: tuple, fallback: Any) -> Any:
+    return value if value in allowed else fallback
 
 
 async def ws_endpoint(ws: WebSocket) -> None:
-    """Live channel. Claude's writes are pushed down; the user's edits come back up,
-    so board_read reflects what they actually typed and dragged.
+    """Live channel. Claude's writes are pushed down; everyone's edits come back
+    up, so board_read reflects what people actually typed and dragged.
 
-    The socket's role comes from the token it connected with, not from anything the
-    page claims, so a shared connection can neither see the private layer nor touch
-    it."""
-    host = _is_host(ws.scope)
+    Every connection is equal — one board, one view."""
     await ws.accept()
-    await board.add_client(ws, host)
+    await board.add_client(ws)
     try:
         while True:
             msg = json.loads(await ws.receive_text())
             kind = msg.get("type")
 
-            # ---- edits aimed at one existing node ----
-            if kind in ("user_text", "user_move", "user_resize", "user_language",
-                        "user_title", "user_private", "user_delete"):
-                ident = msg.get("id", "")
-                node = board.nodes.get(ident)
-                if node is None or (node.get("private") and not host):
-                    continue                      # unknown, or not this socket's to touch
+            if kind in ("user_text", "user_resize", "user_language", "user_title"):
+                node = board.nodes.get(msg.get("id", ""))
+                if node is None:
+                    continue
                 if kind == "user_text":
                     node["text"] = str(msg.get("text", ""))[:20000]
-                elif kind == "user_move":
-                    node["x"], node["y"] = int(msg.get("x", 0)), int(msg.get("y", 0))
                 elif kind == "user_resize":
-                    node["w"] = max(80, min(1600, int(msg.get("w", node["w"]))))
-                    node["h"] = max(40, min(1400, int(msg.get("h", node["h"]))))
+                    node["w"] = max(60, min(1600, int(msg.get("w", node["w"]))))
+                    node["h"] = max(32, min(1400, int(msg.get("h", node["h"]))))
+                    node["fitted"] = bool(msg.get("fitted", False))
                 elif kind == "user_language":
                     node["language"] = str(msg.get("language", "text"))[:24]
                 elif kind == "user_title":
                     node["title"] = str(msg.get("title", ""))[:120]
-                elif kind == "user_private" and host:
-                    node["private"] = bool(msg.get("private"))
-                elif kind == "user_delete":
-                    board.remove_node(ident)
-                if kind != "user_delete":
-                    node["author"] = "user"
+                node["author"] = "user"
                 await board.commit("user")
+
+            elif kind == "user_move":
+                moved = False
+                for spec in msg.get("moves") or []:
+                    node = board.nodes.get(spec.get("id", ""))
+                    if node is None:
+                        continue
+                    node["x"], node["y"] = int(spec.get("x", 0)), int(spec.get("y", 0))
+                    node["author"] = "user"
+                    moved = True
+                if moved:
+                    await board.commit("user")
+
+            elif kind == "user_style":
+                changes: Dict[str, Any] = {}
+                for key, allowed in (("fill", COLORS), ("stroke", COLORS), ("size", SIZES),
+                                     ("shape", ("rect", "ellipse", "diamond"))):
+                    if msg.get(key) in allowed:
+                        changes[key] = msg[key]
+                if "bold" in msg:
+                    changes["bold"] = bool(msg["bold"])
+                if changes:
+                    hit = False
+                    for ident in msg.get("ids") or []:
+                        node = board.nodes.get(ident)
+                        if node is not None:
+                            node.update(changes)
+                            node["author"] = "user"
+                            hit = True
+                    for ident in msg.get("edge_ids") or []:
+                        edge = board.edges.get(ident)
+                        if edge is not None and "stroke" in changes:
+                            edge["color"] = changes["stroke"]
+                            hit = True
+                    if hit:
+                        await board.commit("user")
 
             elif kind == "user_add":
                 node_kind = msg.get("kind", "box")
@@ -1176,61 +1338,42 @@ async def ws_endpoint(ws: WebSocket) -> None:
                     node_kind,
                     text=str(msg.get("text", ""))[:20000],
                     language=str(msg.get("language", "python"))[:24],
-                    shape=str(msg.get("shape", "rect"))[:16],
-                    # only a host connection can author into the private layer
-                    private=bool(msg.get("private")) and host,
+                    fill=_clean(msg.get("fill"), COLORS, "yellow" if node_kind == "sticky" else "none"),
                     author="user",
                     x=msg.get("x"), y=msg.get("y"),
                 )
                 await board.commit("user")
 
+            elif kind == "user_delete":
+                gone = False
+                for ident in msg.get("ids") or []:
+                    if ident in board.edges:
+                        del board.edges[ident]
+                        gone = True
+                    elif board.remove_node(ident):
+                        gone = True
+                if gone:
+                    await board.commit("user")
+
             elif kind == "user_connect":
                 src, dst = msg.get("from", ""), msg.get("to", "")
-                if (src in board.nodes and dst in board.nodes and src != dst
-                        and board.readable(src, host) and board.readable(dst, host)
-                        and board.nodes[src]["private"] == board.nodes[dst]["private"]):
+                if src in board.nodes and dst in board.nodes and src != dst:
                     edge = board.connect(src, dst)
                     edge["author"] = "user"
                     await board.commit("user")
 
-            elif kind == "user_disconnect":
-                edge = board.edges.get(msg.get("id", ""))
-                if edge and board.readable(edge["from"], host):
-                    del board.edges[edge["id"]]
-                    await board.commit("user")
-
             elif kind == "user_arrange":
-                board.arrange()
+                board.arrange(_clean(msg.get("layout"), ("layered", "grid"), "layered"))
                 await board.commit("user")
 
-            # ---- the private layer: host connections only ----
-            elif kind == "user_note" and host:
-                text = (msg.get("text") or "").strip()
-                if text:
-                    board.notes.append({"text": text[:400], "at": now_iso(), "author": "user"})
-                    del board.notes[:-MAX_NOTES]
-                    await board.commit("user")
+            elif kind == "user_undo":
+                if board.undo():
+                    await board.commit("user", remember=False)
 
-            elif kind == "user_note_delete" and host:
-                index = int(msg.get("index", -1))
-                if 0 <= index < len(board.notes):
-                    del board.notes[index]
-                    await board.commit("user")
+            elif kind == "user_redo":
+                if board.redo():
+                    await board.commit("user", remember=False)
 
-            elif kind == "user_rubric" and host:
-                label = (msg.get("label") or "").strip()
-                if label:
-                    row = next((r for r in board.rubric
-                                if r["label"].lower() == label.lower()), None)
-                    if row is None:
-                        row = {"label": label[:80], "verdict": "unset", "note": ""}
-                        board.rubric.append(row)
-                    row["verdict"] = str(msg.get("verdict", "unset"))[:16]
-                    if msg.get("note") is not None:
-                        row["note"] = str(msg["note"])[:300]
-                    await board.commit("user")
-
-            # ---- whole-board actions ----
             elif kind == "user_new":
                 name = (msg.get("name") or "").strip() or "Untitled board"
                 if board.rev > 0:
@@ -1265,18 +1408,12 @@ async def ws_endpoint(ws: WebSocket) -> None:
 # session-manager lifespan and the endpoint at /mcp. Add the board's own routes
 # to it so everything runs in one process on one port.
 #
-# transport_security must be passed explicitly, and its rebinding guard is turned
-# off deliberately. Left unset the SDK sees a loopback host and allows only
+# The SDK's DNS-rebinding guard is off deliberately. Left on it allows only
 # 127.0.0.1/localhost, so every request through a tunnel dies with 421 Invalid
-# Host header. An allow-list doesn't fix it either: the hostname isn't knowable
-# when Claude Desktop starts this server, and a Cloudflare quick tunnel invents a
-# new one on every run.
-#
-# What the guard defends against is an unauthenticated loopback server — a page
-# in your browser quietly POSTing to 127.0.0.1. Gate already refuses every
-# request that doesn't carry a token, and /mcp needs the interviewer's one
-# specifically, so nothing reaches this middleware unauthenticated and the Host
-# check has nothing left to protect. Content-Type is still enforced.
+# Host header — and an allow-list can't fix that, because the hostname isn't
+# knowable when the server starts and a quick tunnel invents a new one each run.
+# What the guard defends is an unauthenticated loopback server; Gate refuses
+# every request without the token, so there is nothing left for it to protect.
 app = mcp.streamable_http_app(
     stateless_http=True,
     streamable_http_path="/mcp",
@@ -1284,19 +1421,13 @@ app = mcp.streamable_http_app(
 )
 app.router.routes[:0] = [
     Route("/", page),
-    Route("/host", host_page),
     Route("/health", health),
     WebSocketRoute("/ws", ws_endpoint),
 ]
 
 
 class Gate:
-    """Rejects anyone without a token, and decides which view they get.
-
-    There are two tokens. The shared one opens the board and nothing else; the
-    interviewer's one also opens /host and /mcp. So the link you hand a candidate
-    gives them the canvas without the private layer behind it, and without the
-    ability to drive Claude's tools against the board.
+    """Rejects anyone without the token.
 
     Deliberately answers 403 and not 401. A 401 from an MCP endpoint means "this
     resource uses OAuth" under the MCP auth spec, so Claude responds by hunting for
@@ -1306,36 +1437,22 @@ class Gate:
     The token can arrive as an Authorization header or as ?t= on the URL, so the
     connector URL can simply end in /mcp?t=YOUR_TOKEN."""
 
-    HOST_ONLY = ("/mcp", "/host")
-
     def __init__(self, inner) -> None:
         self.inner = inner
 
     @staticmethod
-    def _role(scope) -> Optional[str]:
+    def _authorized(scope) -> bool:
         headers = dict(scope.get("headers") or [])
-        bearer = headers.get(b"authorization", b"").decode()
+        if secrets.compare_digest(headers.get(b"authorization", b"").decode(), f"Bearer {TOKEN}"):
+            return True
         supplied = parse_qs(scope.get("query_string", b"").decode()).get("t", [""])[0]
-        for token, role in ((HOST_TOKEN, "host"), (TOKEN, "guest")):
-            if (secrets.compare_digest(bearer, f"Bearer {token}")
-                    or secrets.compare_digest(supplied, token)):
-                return role
-        return None
-
-    def _allowed(self, scope) -> Optional[str]:
-        role = self._role(scope)
-        if role is None:
-            return None
-        path = scope.get("path", "")
-        host_only = any(path == p or path.startswith(p + "/") for p in self.HOST_ONLY)
-        return role if role == "host" or not host_only else None
+        return secrets.compare_digest(supplied, TOKEN)
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] not in ("http", "websocket"):
             await self.inner(scope, receive, send)
             return
-        role = self._allowed(scope)
-        if role is None:
+        if not self._authorized(scope):
             if scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 1008})
             else:
@@ -1343,7 +1460,6 @@ class Gate:
                             "headers": [(b"content-type", b"text/plain")]})
                 await send({"type": "http.response.body", "body": b"Forbidden"})
             return
-        scope["board_role"] = role
         await self.inner(scope, receive, send)
 
 
@@ -1353,24 +1469,22 @@ gated_app = Gate(app)
 def _open_app_window(url: str) -> bool:
     """Run the board in its own frameless window instead of a browser tab.
 
-    pywebview drives the macOS Cocoa loop, which has to own the main thread, so the
-    server goes to a background thread and this call blocks until the window is
-    closed — at which point the process is meant to end."""
+    pywebview drives the macOS Cocoa loop, which has to own the main thread, so
+    this blocks until the window is closed."""
     try:
         import webview
     except ImportError:
         print("  The app window needs pywebview:  ./venv/bin/pip install pywebview")
         print(f"  Serving in the browser instead:  {url}\n")
         return False
-    webview.create_window("Interview board", url, width=1240, height=860,
+    webview.create_window("Board", url, width=1240, height=860,
                           min_size=(760, 540), on_top=os.environ.get("BOARD_ON_TOP") == "1")
     webview.start()
     return True
 
 
 def _pick_port(preferred: int) -> int:
-    """Claude Desktop may start this while a `bash run.sh` is already holding the
-    usual port. Step aside rather than dying."""
+    """Another board may already be holding the usual port. Step aside."""
     for candidate in [preferred, *range(preferred + 1, preferred + 20)]:
         with socket.socket() as probe:
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1383,16 +1497,12 @@ def _pick_port(preferred: int) -> int:
 
 
 def _find_owner() -> Optional[int]:
-    """Look for a board server that is already running.
-
-    Claude Desktop starts one of these per surface — the chat and a Claude Code
-    session each get their own — and a `bash run.sh` may be up as well. Left
-    alone they would each hold a different board, so Claude would write to one
-    while you sat looking at another. Whoever got here first owns the board."""
+    """Look for a board server that is already running, so several MCP clients
+    share one board rather than each holding an invisible one of its own."""
     for candidate in range(PORT, PORT + 20):
         try:
             with urllib.request.urlopen(
-                    f"http://{HOST}:{candidate}/health?t={HOST_TOKEN}", timeout=1) as response:
+                    f"http://{HOST}:{candidate}/health?t={TOKEN}", timeout=1) as response:
                 if json.loads(response.read()).get("ok"):
                     return candidate
         except (urllib.error.URLError, OSError, ValueError):
@@ -1406,7 +1516,7 @@ def _proxy_error(line: str, problem: Exception) -> Optional[str]:
     except (json.JSONDecodeError, AttributeError):
         ident = None
     if ident is None:
-        return None                      # a notification wants no reply, even a bad one
+        return None
     return json.dumps({"jsonrpc": "2.0", "id": ident, "error": {
         "code": -32000,
         "message": f"The board server stopped answering ({problem}). "
@@ -1415,12 +1525,9 @@ def _proxy_error(line: str, problem: Exception) -> Optional[str]:
 
 
 async def _run_stdio_proxy(port: int) -> None:
-    """Hand this session's tool calls to the process that owns the board.
-
-    The owner already speaks MCP over HTTP, so this forwards whole JSON-RPC
-    messages rather than reimplementing any tool: every surface ends up driving
-    one board, and there is only ever one window to look at."""
-    endpoint = f"http://{HOST}:{port}/mcp?t={HOST_TOKEN}"
+    """Hand this session's tool calls to the process that owns the board, by
+    forwarding whole JSON-RPC messages to the MCP endpoint it already serves."""
+    endpoint = f"http://{HOST}:{port}/mcp?t={TOKEN}"
     loop = asyncio.get_running_loop()
 
     def forward(line: str) -> Optional[str]:
@@ -1451,13 +1558,10 @@ async def _run_stdio_proxy(port: int) -> None:
 
 
 def _run_stdio() -> None:
-    """Serve MCP over stdin/stdout for Claude Desktop's local servers, with the
-    board's own page on a loopback port beside it.
+    """Serve MCP over stdin/stdout, with the board's page on a loopback port.
 
-    No tunnel and no connector URL: Claude starts this process itself, so there is
-    nothing public to reach and nothing to re-paste when it restarts. Everything
-    that would normally print must go to stderr — stdout is the JSON-RPC stream,
-    and one stray line through it ends the session."""
+    Everything that would normally print must go to stderr — stdout is the
+    JSON-RPC stream, and one stray line through it ends the session."""
     global WINDOW_URL
     import uvicorn
 
@@ -1465,12 +1569,12 @@ def _run_stdio() -> None:
 
     owner = _find_owner()
     if owner is not None:
-        print(f"interview board already running on port {owner}; sharing it", file=sys.stderr)
+        print(f"board already running on port {owner}; sharing it", file=sys.stderr)
         asyncio.run(_run_stdio_proxy(owner))
         return
 
     port = _pick_port(PORT)
-    WINDOW_URL = f"http://{HOST}:{port}/host?t={HOST_TOKEN}"
+    WINDOW_URL = f"http://{HOST}:{port}/?t={TOKEN}"
     config = uvicorn.Config(gated_app, host=HOST, port=port,
                             log_level="critical", log_config=None)
     server = uvicorn.Server(config)
@@ -1479,13 +1583,12 @@ def _run_stdio() -> None:
     deadline = time.time() + 15
     while not server.started and time.time() < deadline:
         time.sleep(0.05)
-    print(f"interview board on {WINDOW_URL}", file=sys.stderr)
+    print(f"board on {WINDOW_URL}", file=sys.stderr)
 
     asyncio.run(mcp.run_stdio_async())
 
 
 if __name__ == "__main__":
-    # A window is its own short-lived process; see _ensure_window.
     if "--window" in sys.argv:
         _open_app_window(sys.argv[sys.argv.index("--window") + 1])
         raise SystemExit
@@ -1496,13 +1599,12 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    host_url = f"http://{HOST}:{PORT}/host?t={HOST_TOKEN}"
+    board_url = f"http://{HOST}:{PORT}/?t={TOKEN}"
     if os.environ.get("BOARD_BANNER") != "0":   # run.sh prints its own
-        print("\n  Interview board")
-        print(f"  Yours    {host_url}")
-        print(f"  Share    http://{HOST}:{PORT}/?t={TOKEN}")
-        print(f"  MCP      http://{HOST}:{PORT}/mcp?t={HOST_TOKEN}")
-        print(f"  Saving   {BOARDS_DIR}  ({len(store.index())} saved)\n")
+        print("\n  Board")
+        print(f"  Open    {board_url}")
+        print(f"  MCP     http://{HOST}:{PORT}/mcp?t={TOKEN}")
+        print(f"  Saving  {BOARDS_DIR}  ({len(store.index())} saved)\n")
 
     config = uvicorn.Config(gated_app, host=HOST, port=PORT, log_level="warning")
     server = uvicorn.Server(config)
@@ -1513,7 +1615,7 @@ if __name__ == "__main__":
         deadline = time.time() + 15
         while not server.started and thread.is_alive() and time.time() < deadline:
             time.sleep(0.05)
-        if not _open_app_window(host_url):
-            thread.join()      # no window to be had; behave like a plain server
+        if not _open_app_window(board_url):
+            thread.join()
     else:
         server.run()

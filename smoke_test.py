@@ -1,9 +1,6 @@
 """Exercises the board without Claude, so you can debug in isolation.
 
-    BOARD_HOST_TOKEN=$(cat .token.host) BOARD_TOKEN=$(cat .token) python smoke_test.py
-
-Both tokens are needed: the point of half these checks is that the shared one
-cannot reach what the interviewer's one can.
+    BOARD_TOKEN=$(cat .token) python smoke_test.py
 """
 
 import asyncio
@@ -14,10 +11,10 @@ import urllib.request
 import websockets
 
 BASE = os.environ.get("BOARD_BASE", "http://127.0.0.1:8765")
-HOST_TOKEN = os.environ.get("BOARD_HOST_TOKEN", "")
-GUEST_TOKEN = os.environ.get("BOARD_TOKEN", "")
+TOKEN = os.environ.get("BOARD_TOKEN", "")
 WS = BASE.replace("http", "ws")
 _id = [0]
+
 
 def rpc(method, params):
     _id[0] += 1
@@ -25,7 +22,7 @@ def rpc(method, params):
     req = urllib.request.Request(f"{BASE}/mcp", body, {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
-        "Authorization": f"Bearer {HOST_TOKEN}",
+        "Authorization": f"Bearer {TOKEN}",
     })
     raw = urllib.request.urlopen(req).read().decode()
     data = [l for l in raw.splitlines() if l.startswith("data: ")][-1]
@@ -33,12 +30,10 @@ def rpc(method, params):
 
 
 def tool(name, args=None):
-    payload = {"name": name, "arguments": args or {}}
-    return rpc("tools/call", payload)["content"][0]["text"]
+    return rpc("tools/call", {"name": name, "arguments": args or {}})["content"][0]["text"]
 
 
 def call(name, args=None):
-    """A tool call whose JSON result you want as a dict."""
     return json.loads(tool(name, args))
 
 
@@ -46,135 +41,125 @@ async def main():
     rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                        "clientInfo": {"name": "smoke", "version": "1"}})
 
-    async with websockets.connect(f"{WS}/ws?t={HOST_TOKEN}") as ws:
+    async with websockets.connect(f"{WS}/ws?t={TOKEN}") as ws:
         await ws.recv()
 
         async def pushed():
             return json.loads(await asyncio.wait_for(ws.recv(), 3))
 
-        print("new board   ->", tool("board_new", {"name": "Smoke Test — Two Sum"}))
+        print("new board   ->", tool("board_new", {"name": "Smoke Test — Canvas"}))
         await pushed()
 
-        doc = call("board_add_doc", {"text": "def two_sum(nums, target):\n    pass\n",
-                                     "language": "python", "title": "Two Sum"})
-        print("add doc     ->", doc)
-        p = await pushed()
-        print("             browser got rev", p["board"]["rev"], "from", p["origin"])
-
-        print("patch       ->", tool("board_patch_doc", {
-            "id": doc["id"], "find": "    pass", "replace": "    seen = {}\n    return seen"}))
+        # ---- one call builds a whole diagram ----------------------------
+        built = call("board_apply", {
+            "nodes": [
+                {"key": "client", "kind": "box", "text": "Client", "fill": "blue"},
+                {"key": "api", "kind": "box", "text": "API", "fill": "green"},
+                {"key": "db", "kind": "box", "text": "Postgres", "fill": "orange"},
+                {"key": "cache", "kind": "box", "text": "Redis", "fill": "red"},
+                {"key": "note", "kind": "sticky", "text": "Cache invalidation?", "fill": "yellow"},
+            ],
+            "edges": [
+                {"from": "client", "to": "api", "text": "https"},
+                {"from": "api", "to": "db", "text": "writes"},
+                {"from": "api", "to": "cache", "text": "reads", "style": "dashed", "color": "red"},
+            ],
+            "layout": "layered",
+        })
+        print("batch build ->", {k: built[k] for k in ("ok", "nodes", "edges")})
+        assert built["ok"] and built["nodes"] == 5 and built["edges"] == 3
         await pushed()
+        ids = built["ids"]
 
-        print("bad patch   ->", tool("board_patch_doc", {"find": "nope", "replace": "x"}))
-
-        api = call("board_add_box", {"label": "API"})
-        db = call("board_add_box", {"label": "Postgres"})
-        await pushed(); await pushed()
-        print("connect     ->", tool("board_connect", {"source": api["id"], "target": db["id"],
-                                                       "label": "write"}))
-        await pushed()
-
-        print("diagram     ->", tool("board_draw_diagram", {
-            "mermaid": "graph TD; A[scan]-->B[hash lookup];", "title": "Approach"}))
-        await pushed()
-
-        # the interviewer's own layer
-        secret = call("board_add_doc", {"text": "# model answer: one pass, hash map",
-                                        "language": "python", "title": "Model answer",
-                                        "private": True})
-        await pushed()
-        print("private doc ->", secret)
-        assert secret["private"] is True
-
-        print("crossing    ->", tool("board_connect", {"source": api["id"], "target": secret["id"]}))
-        assert json.loads(tool("board_connect", {"source": api["id"],
-                                                 "target": secret["id"]}))["ok"] is False
-
-        tool("board_note", {"text": "O(n) target stated unprompted"})
-        await pushed()
-        tool("board_rubric", {"label": "Complexity", "verdict": "strong", "note": "no prompting"})
-        await pushed()
-
-        # the user types over Claude's document and drags a box
-        await ws.send(json.dumps({"type": "user_text", "id": doc["id"],
-                                  "text": "# my own attempt\nfor i in range(n):\n    ..."}))
-        await pushed()
-        await ws.send(json.dumps({"type": "user_move", "id": api["id"], "x": 900, "y": 120}))
-        await pushed()
-
+        # layered layout should put client left of api left of db
         state = json.loads(tool("board_read", {"response_format": "json"}))
-        assert "my own attempt" in state["nodes"][doc["id"]]["text"], "user edit invisible to Claude"
-        assert state["nodes"][api["id"]]["x"] == 900, "user drag invisible to Claude"
-        assert state["last_editor"] == "user"
-        assert len(state["notes"]) == 1 and len(state["rubric"]) == 1
-        print("read back   -> Claude sees the user's live edits and drags")
+        xs = {k: state["nodes"][v]["x"] for k, v in ids.items()}
+        assert xs["client"] < xs["api"] < xs["db"], f"layered layout wrong: {xs}"
+        print("layout      -> client < api < db, so it followed the arrows")
 
-        # ---- what the shared view can and cannot reach -------------------
-        async with websockets.connect(f"{WS}/ws?t={GUEST_TOKEN}") as guest:
-            shared = json.loads(await guest.recv())["board"]
-            assert secret["id"] not in shared["nodes"], "private node reached the shared view"
-            assert "notes" not in shared and "rubric" not in shared, "private layer leaked"
-            assert shared["host"] is False
-            print("shared view ->", len(shared["nodes"]), "of", len(state["nodes"]),
-                  "nodes, no notes, no rubric")
-
-            await guest.send(json.dumps({"type": "user_text", "id": secret["id"], "text": "PWNED"}))
-            await guest.send(json.dumps({"type": "user_note", "text": "sneaky"}))
-            await guest.send(json.dumps({"type": "user_add", "kind": "box",
-                                         "text": "sneaky box", "private": True}))
-            await asyncio.sleep(0.4)
-
+        # ---- styling, singly and in bulk --------------------------------
+        print("style one   ->", tool("board_update", {"id": ids["api"], "fill": "purple", "bold": True}))
+        await pushed()
+        print("style many  ->", tool("board_update",
+                                     {"ids": [ids["db"], ids["cache"]], "stroke": "grey"}))
+        await pushed()
         after = json.loads(tool("board_read", {"response_format": "json"}))
-        assert after["nodes"][secret["id"]]["text"].startswith("# model answer"), \
-            "shared view edited a private node"
-        assert len(after["notes"]) == 1, "shared view wrote a private note"
-        sneaky = [n for n in after["nodes"].values() if n["text"] == "sneaky box"]
-        assert sneaky and sneaky[0]["private"] is False, "shared view authored into the private layer"
-        print("guards      -> shared view cannot read, edit or author the private layer")
+        assert after["nodes"][ids["api"]]["fill"] == "purple"
+        assert after["nodes"][ids["api"]]["bold"] is True
+        assert all(after["nodes"][ids[k]]["stroke"] == "grey" for k in ("db", "cache"))
+        print("             colours and weight stuck")
 
-        hidden = json.loads(tool("board_read", {"response_format": "json",
-                                                "include_private": False}))
-        assert secret["id"] not in hidden["nodes"] and "notes" not in hidden
-        print("read shared -> board_read can also stand in the candidate's shoes")
+        print("bad colour  ->", tool("board_apply",
+                                     {"nodes": [{"key": "x", "text": "no", "fill": "chartreuse"}]}))
+        assert json.loads(tool("board_apply",
+                               {"nodes": [{"key": "x", "text": "no", "fill": "chartreuse"}]}))["ok"] is False
 
-        await asyncio.sleep(2.5)  # let autosave land
-
-        # switch away, then come back to it
-        print("second board->", tool("board_new", {"name": "Smoke Test — LRU Cache"}))
+        # ---- undo / redo -------------------------------------------------
+        before_rev = after["rev"]
+        doc = call("board_add_doc", {"text": "def f():\n    pass", "title": "Sketch"})
         await pushed()
-        tool("board_add_doc", {"text": "class LRUCache: ...", "language": "python"})
-        await pushed()
-        await asyncio.sleep(2.5)
+        assert doc["id"] in json.loads(tool("board_read", {"response_format": "json"}))["nodes"]
 
+        print("undo        ->", tool("board_undo"))
+        await pushed()
+        undone = json.loads(tool("board_read", {"response_format": "json"}))
+        assert doc["id"] not in undone["nodes"], "undo didn't remove the document"
+        assert undone["can_redo"] is True
+
+        print("redo        ->", tool("board_redo"))
+        await pushed()
+        redone = json.loads(tool("board_read", {"response_format": "json"}))
+        assert doc["id"] in redone["nodes"], "redo didn't put it back"
+        print("             history works both ways")
+
+        # ---- the page's own edits reach Claude ---------------------------
+        await ws.send(json.dumps({"type": "user_move",
+                                  "moves": [{"id": ids["client"], "x": 900, "y": 120}]}))
+        await pushed()
+        await ws.send(json.dumps({"type": "user_style", "ids": [ids["client"]], "fill": "pink"}))
+        await pushed()
+        await ws.send(json.dumps({"type": "user_text", "id": ids["note"], "text": "typed here"}))
+        await pushed()
+
+        live = json.loads(tool("board_read", {"response_format": "json"}))
+        assert live["nodes"][ids["client"]]["x"] == 900, "drag invisible to Claude"
+        assert live["nodes"][ids["client"]]["fill"] == "pink", "restyle invisible to Claude"
+        assert live["nodes"][ids["note"]]["text"] == "typed here", "typing invisible to Claude"
+        assert live["last_editor"] == "user"
+        print("read back   -> Claude sees drags, restyles and typing")
+
+        # ---- one board for everyone --------------------------------------
+        async with websockets.connect(f"{WS}/ws?t={TOKEN}") as second:
+            theirs = json.loads(await second.recv())["board"]
+            assert set(theirs["nodes"]) == set(live["nodes"]), "second viewer saw a different board"
+            assert "notes" not in theirs and "rubric" not in theirs
+            await second.send(json.dumps({"type": "user_style",
+                                          "ids": [ids["db"]], "fill": "green"}))
+            await asyncio.sleep(0.3)
+        mine = json.loads(tool("board_read", {"response_format": "json"}))
+        assert mine["nodes"][ids["db"]]["fill"] == "green", "second viewer's edit didn't land"
+        print("two viewers -> same board, edits from either side land")
+
+        await asyncio.sleep(2.5)  # let autosave happen
+
+        print("second board->", tool("board_new", {"name": "Smoke Test — Empty"}))
+        await pushed()
         listed = call("board_list")
-        names = [b["name"] for b in listed["boards"]]
-        print("list        ->", listed["count"], "boards:", names)
-        assert "Smoke Test — Two Sum" in names and "Smoke Test — LRU Cache" in names
+        assert "Smoke Test — Canvas" in [b["name"] for b in listed["boards"]]
 
-        print("load        ->", tool("board_load", {"name": "two sum"}))
+        print("load        ->", tool("board_load", {"name": "canvas"}))
         await pushed()
         back = json.loads(tool("board_read", {"response_format": "json"}))
-        assert any("my own attempt" in n["text"] for n in back["nodes"].values()), \
-            "board did not survive the round trip"
-        assert any(n["private"] for n in back["nodes"].values()), "private layer lost on reload"
-        assert len(back["notes"]) == 1 and len(back["rubric"]) == 1
-        assert any(n["type"] == "diagram" for n in back["nodes"].values())
-        assert back["edges"], "lines lost on reload"
-        print("             reloaded board still has documents, lines, notes and the private layer")
+        assert len(back["nodes"]) >= 5 and back["edges"], "board didn't survive the round trip"
+        assert any(n["fill"] == "pink" for n in back["nodes"].values()), "styling lost on reload"
+        print("             reloaded with its nodes, lines and colours")
 
-        print("tidy        ->", tool("board_arrange"))
+        print("tidy        ->", tool("board_arrange", {"layout": "grid"}))
+        await pushed()
+        print("delete      ->", tool("board_delete", {"name": "empty", "confirm": True}))
         await pushed()
 
-        print("ambiguous   ->", tool("board_load", {"name": "smoke test"}))
-        print("missing     ->", tool("board_load", {"name": "does-not-exist"}))
-        print("unconfirmed ->", tool("board_delete", {"name": "lru", "confirm": False}))
-        print("delete open ->", tool("board_delete", {"name": "two sum", "confirm": True}))
-        print("delete      ->", tool("board_delete", {"name": "lru cache", "confirm": True}))
-        await pushed()
-
-        remaining = [b["name"] for b in call("board_list")["boards"]]
-        assert "Smoke Test — LRU Cache" not in remaining
-        print("\nPASS: canvas, live sync, the private layer, autosave, reload and delete all work.")
+        print("\nPASS: batch build, layout, styling, undo/redo, live sync and reload all work.")
 
 
 asyncio.run(main())

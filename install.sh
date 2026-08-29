@@ -30,7 +30,6 @@ fi
 
 # Minted here rather than at launch so the board's own URL never changes.
 [ -f .token ] || ./venv/bin/python -c "import secrets;print(secrets.token_urlsafe(24))" > .token
-[ -f .token.host ] || ./venv/bin/python -c "import secrets;print(secrets.token_urlsafe(24))" > .token.host
 
 REMOVE=0
 [ "${1:-}" = "--remove" ] && REMOVE=1

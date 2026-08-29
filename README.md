@@ -1,12 +1,11 @@
-# Interview board — setup for macOS
+# Board — a live canvas Claude can draw on
 
-A live interview canvas Claude can draw on while you're in voice mode. You talk,
-and documents, boxes and diagrams appear in a window you keep beside the Claude
-app. You type and drag on it, and Claude can read what you did.
+A live canvas Claude can draw on while you're in voice mode. You talk, and
+documents, boxes, stickies and diagrams appear in a window you keep beside the
+Claude app. You drag, restyle and type on it, and Claude can read what you did.
 
-It also keeps a layer the candidate never sees — your notes, a rubric, a model
-answer you reveal when you're ready — so one board serves both of you. Boards
-are saved on your Mac so you can reopen them later.
+One board, shared by everyone who has the link. It runs on your Mac, boards save
+as plain JSON files, and no account is involved.
 
 This guide assumes you have never used Terminal. It takes about ten minutes,
 most of which is waiting.
@@ -30,8 +29,8 @@ the server as a program on your machine. Nothing on the web or on your phone can
 reach it.
 
 **Tunnel.** Puts the board on a public https address so Claude reaches it from
-anywhere. You need this if the candidate is joining from their own machine, or if
-you use voice mode on your phone. It costs you a fresh URL to paste into Claude's
+anywhere. **Voice mode needs this** — voice runs on Claude's servers, which cannot
+start a program on your Mac. Also needed if someone else joins from their machine. It costs you a fresh URL to paste into Claude's
 connector settings every time you restart it. That's steps 1–8 below.
 
 Both can coexist. Install the local one for everyday use and run `bash run.sh`
@@ -63,7 +62,7 @@ To undo it: `bash install.sh --remove`, then restart Claude Desktop.
 ### Opening the board yourself
 
 The window appears on its own the first time Claude draws on the board. To pull
-it up before that — to set up before a candidate joins, or just to look at
+it up before that — to set something up in advance, or just to look at
 yesterday's board — **double-click `open_board.command`** in Finder, or:
 
 ```
@@ -71,8 +70,8 @@ bash open_board.command
 ```
 
 It finds whichever board is already running and opens a window on it. If nothing
-is running it starts one first. `--share` opens the candidate's view instead, and
-`--print` just prints the URL if you'd rather paste it into a browser.
+is running it starts one first. `--print` just prints the URL if you'd rather
+paste it into a browser.
 
 ### One board, however many Claudes
 
@@ -86,12 +85,12 @@ talk to Claude from. If you ever suspect you're looking at a stale one,
 `bash open_board.command --print` tells you which port actually holds it.
 
 
-**Sharing with a candidate on another machine** still needs a public address —
-run `bash run.sh` for that session and hand them the share link it prints.
+**Voice mode, or anyone joining from another machine,** needs a public address —
+run `bash run.sh` for that and hand out the link it prints.
 
 ## The tunnel route
 
-Only needed for remote candidates or phone voice mode.
+Needed for voice mode, and for anyone joining from another machine.
 
 ## Step 1 · Put the folder somewhere permanent
 
@@ -152,7 +151,7 @@ The first time, this takes a minute or two while it installs what it needs. When
 it's ready you'll see a box like this:
 
 ```
-  ── Interview board ────────────────────────────────────
+  ── Board ──────────────────────────────────────────────
 
   1. Your board opens in its own window. Park it beside Claude.
 
@@ -161,7 +160,7 @@ it's ready you'll see a box like this:
 
      https://something-random.trycloudflare.com/mcp?t=HOST-TOKEN
 
-  3. Share this with the candidate — canvas only, no notes, no tools:
+  3. Anyone else who should see it opens:
 
      https://something-random.trycloudflare.com/?t=SHARED-TOKEN
 
@@ -180,9 +179,7 @@ Note the two different links. They are not interchangeable — see
 The board opens by itself in a plain window with no browser chrome, so you can
 park it beside the Claude app and stay in voice mode without tab-switching.
 
-Top right it should say **live** with a green dot, and **interviewer view** in a
-gold pill — that pill is how you know you're looking at the view with your
-private notes on it, not the one you shared.
+Top right it should say **live** with a green dot.
 
 To keep it above other windows, start with `BOARD_ON_TOP=1 bash run.sh`. To go
 back to an ordinary browser tab instead, `bash run.sh --no-app`.
@@ -191,7 +188,7 @@ back to an ordinary browser tab instead, `bash run.sh --no-app`.
 
 In Claude: **Customize → Connectors → + → Add custom connector**.
 
-- **Name**: Interview board
+- **Name**: Board
 - **URL**: the whole `https://...trycloudflare.com/mcp?t=...` line from **box 2**,
   including the `?t=` part on the end — that's your password
 - **Advanced settings**: leave blank. Client ID and secret are for OAuth
@@ -214,9 +211,8 @@ Switch to voice mode and say something like:
 
 > Run a mock interview using my board connector. Start a new board named after
 > the problem, and never dictate code out loud — write it to the board. Keep a
-> model answer on the private layer so I can reveal it at the end, and take
-> private notes as we go. When I say I've written something, read the board and
-> critique it rather than solving it for me.
+> When I say I've written something, read the board and critique it rather than
+> solving it for me. Use board_apply when you're drawing more than one thing.
 
 Ask it to write something and watch the window.
 
@@ -265,12 +261,8 @@ dropped from the end of the URL.
 connected. Close and reopen it. Claude is told when nobody's watching, so you
 can also just ask "is anyone viewing the board?"
 
-**You can't see something Claude says it wrote** — it may be on the private
-layer, which only your window renders. Ask "is that private?" or look for the
-gold dashed border.
-
-**The candidate says they can't see something** — check whether it's private.
-Ask Claude to make it shared, or click the ◐ button on the node.
+**Someone else can't see the board** — they need the same link, including the
+`?t=` part. Everyone with it sees and edits the same canvas.
 
 **Nothing works and you want to check the board itself is fine** — in a second
 Terminal tab (Cmd + T), `cd` to the folder again and run:
@@ -310,121 +302,113 @@ of everything saved, and a New button.
 
 ### What's on the board
 
-One canvas you pan and zoom, holding four kinds of thing:
+One canvas everyone shares, holding five kinds of thing:
 
 | | |
 |---|---|
-| **Documents** | Code or prose, syntax-coloured, editable in place. Several can sit side by side — a brief, the attempt, a rewrite |
-| **Boxes** | Labelled rectangles, ellipses or diamonds for system-design sketching |
-| **Labels** | Bare text dropped anywhere |
+| **Documents** | Code or prose, syntax-coloured, editable in place |
+| **Boxes** | Rectangles, ovals or diamonds — the parts of a system |
+| **Stickies** | Coloured notes, sized to their text, for clustering ideas |
+| **Labels** | Bare text, in three sizes, optionally bold |
 | **Diagrams** | A Mermaid diagram rendered as one node |
 
 Lines connect any two nodes and follow them when either is dragged.
 
-Toolbar keys: **V** select · **B** box · **T** text · **D** doc · **L** line.
-Scroll to pan, pinch or ⌘-scroll to zoom, drag a node's header to move it,
-drag the corner to resize, Backspace to delete the selection. Click a line to
-remove it. **Tidy** reflows everything onto a grid.
+Everything takes a **fill** and a **line colour** from nine named colours, so
+things can be grouped by meaning rather than all looking alike.
 
-### Two tokens
+### Using it by hand
 
-The interviewer's view and the shared view are separate, enforced by the server
-rather than by the page:
+| | |
+|---|---|
+| **V B S T D L** | select, box, sticky, text, doc, line |
+| **Drag on empty canvas** | rubber-band select |
+| **Shift-click** | add to or remove from the selection |
+| **Cmd+A** | select everything |
+| **Alt-drag / scroll** | pan · **Cmd-scroll** zoom |
+| **Cmd+Z / Cmd+Shift+Z** | undo, redo |
+| **Backspace** | delete the selection |
 
-| | Shared link `/?t=…` | Your link `/host?t=…` |
-|---|---|---|
-| The canvas | yes | yes |
-| Private nodes | never sent | yes |
-| Private notes and rubric | never sent | yes |
-| The MCP endpoint | refused | yes |
+Select anything and a style bar appears at the bottom: fill, line colour, text
+size, bold, box shape, delete. It applies to everything selected at once.
 
-Give the candidate the shared link. The private layer is stripped from their
-snapshot before it reaches them, so there is nothing on their machine to reveal
-by poking at the page, and their token cannot drive Claude's tools either.
+**Tidy** lays the whole board out along the arrows. **Export** downloads it as
+PNG or SVG.
 
-Any node can be moved across the line — the ◐ button on a document, or ask
-Claude. Flipping a model answer to shared is how you reveal it at the end.
+Boxes and stickies grow to fit their text until you resize one by hand, after
+which it keeps the size you gave it.
 
 ### The tools Claude gets
 
 | Tool | Effect |
 |---|---|
-| `board_add_doc` | Puts a document on the canvas, optionally private |
+| `board_apply` | **Builds a whole diagram in one call** — nodes, lines and layout |
+| `board_add_doc` | A document: code, or prose in markdown |
 | `board_patch_doc` | Replaces one snippet in place, so the text doesn't jump |
 | `board_add_box` | One labelled box |
+| `board_add_sticky` | One coloured sticky note |
 | `board_add_text` | One floating label |
-| `board_draw_diagram` | Renders a Mermaid diagram as a node |
-| `board_connect` | Draws a line between two nodes |
-| `board_update` | Changes a node's text, title, language, or which layer it's on |
+| `board_draw_diagram` | A Mermaid diagram as a node |
+| `board_connect` | A line between two nodes |
+| `board_update` | Changes text, or restyles one node — or many at once with `ids` |
 | `board_move` | Repositions a node |
-| `board_remove` | Removes a node or a line |
-| `board_arrange` | Reflows everything onto a grid |
-| `board_note` | One line in your private notes |
-| `board_rubric` | Sets where the candidate stands on one dimension |
+| `board_remove` | Removes nodes or lines |
+| `board_arrange` | Lays out `layered` (follows the arrows) or `grid` |
+| `board_undo` / `board_redo` | Steps the whole board through its history |
 | `board_read` | Everything on the board, including what you typed and dragged |
 | `board_clear` | Empties the canvas, same board |
-| `board_new` | Saves current, starts a fresh named board |
-| `board_save` | Save now, or save-as |
-| `board_list` | Every saved board |
-| `board_load` | Reopen a saved board |
-| `board_delete` | Delete one, confirmation required |
+| `board_new` · `board_save` · `board_list` · `board_load` · `board_delete` | Board files |
+
+Names are deliberately uniform: contents are always `text`, a node is always
+`id`, and a line always runs `from_id` to `to_id` — the same words `board_read`
+prints back.
+
+**`board_apply` is the one that matters.** A nine-box architecture diagram is one
+call, laid out along its own arrows, instead of fifteen calls and coordinates
+worked out by hand.
 
 ### How live it is
 
 Claude → board is instant: a tool call pushes over the websocket before the call
-returns, so the canvas updates mid-sentence. Nodes Claude touches pulse once so
-your eye can find them.
+returns, so the canvas updates mid-sentence. Nodes Claude touches pulse once.
 
-Board → Claude is on demand: your typing and dragging sync to the server
-continuously, but Claude only sees them when it calls `board_read`. In practice
-that's invisible — you say "take a look" and it reads first. What you can't get
-is Claude reacting to your typing unprompted; nothing can interrupt a
-conversation from outside.
+Board → Claude is on demand: your typing and dragging sync continuously, but
+Claude only sees them when it calls `board_read`. In practice that's invisible —
+you say "take a look" and it reads first.
 
-Each node's border is coloured by who touched it last: cool for Claude, warm for
-you. Private nodes are dashed and gold.
+Everyone connected sees the same board and can edit it. Undo is shared: it steps
+the board back, whoever made the change.
 
 ### Files
 
 | File | What it is |
 |---|---|
-| `install.sh` | Registers the board with Claude Desktop, so there's no tunnel |
+| `install.sh` | Registers the board with Claude Desktop (text chat only — not voice) |
+| `run.sh` | Starts the board with a public tunnel — needed for voice mode |
 | `open_board.command` | Double-click to open the board window on demand |
-| `reset.sh` | Stops everything and re-registers cleanly when it gets confused |
-| `run.sh` | Starts everything with a public tunnel, for remote candidates |
+| `reset.sh` | Stops everything and re-registers cleanly |
 | `board_mcp.py` | The server — MCP endpoint, board state, websocket, disk store |
 | `board.html` | The canvas |
-| `smoke_test.py` | Tests everything without Claude, including the private layer |
-| `boards/` | Your saved boards |
-| `.token` | The shared password, safe to hand a candidate |
-| `.token.host` | Yours. Opens the private layer and the tools. Don't share it |
+| `smoke_test.py` | Tests everything without Claude |
+| `boards/` | Your saved boards, one JSON file each |
+| `.token` | The password. Anyone with it can open and edit the board |
 
 ### Settings
-
-Set these before `bash run.sh` if you need to:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `BOARD_TOKEN` | generated into `.token` | Shared secret |
-| `BOARD_HOST_TOKEN` | generated into `.token.host` | Interviewer secret |
 | `BOARD_ON_TOP` | unset | `1` floats the window above everything else |
 | `BOARD_DIR` | `./boards` | Where boards save |
 | `BOARD_PORT` | `8765` | Port |
 
-`bash run.sh --no-tunnel` skips the tunnel and works locally only.
-`bash run.sh --no-app` keeps it in a browser tab instead of its own window.
-`./venv/bin/python board_mcp.py --stdio` is what Claude Desktop runs; you
-shouldn't need to call it yourself.
+`bash run.sh --no-tunnel` works locally only. `--no-app` keeps it in a browser tab.
 
 ### One security note
 
-The tunnel address is public, so anyone with the link could reach your Mac's
-board — which is why every route requires a token. Don't paste either token into
-a chat, an issue, or a screenshot.
+The tunnel address is public, so anyone with the link could reach your board —
+which is why every route requires the token. Don't paste it into a chat, an
+issue, or a screenshot. If it leaks, delete `.token`, restart, and re-paste the
+new connector URL.
 
-`.token.host` is the one that matters: it opens your private notes and lets
-anything holding it drive Claude's tools against your board. If you think either
-leaked, delete that file, restart, and re-add the connector with the new value.
-
-Boards never leave your machine — they're JSON files in `boards/`, including the
-private layer.
+Boards never leave your machine — they're JSON files in `boards/`.
